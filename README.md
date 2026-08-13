@@ -1,5 +1,7 @@
 # llamactl NEO
 
+-# Why NEO? A way sloppier, even less performant version of this was written in python before migrating to... this
+
 A native Rust manager for local `llama.cpp` servers, with a full-screen terminal interface built on [Ratatui](https://ratatui.rs/).
 
 The Rust implementation preserves llamactl's XDG paths and JSON configuration/profile formats, so it can use an existing installation without conversion.
@@ -62,6 +64,8 @@ llamactl keys generate
 llamactl scheduler pin MODEL
 llamactl profiles clone quality quality-long
 ```
+
+# Notes for LLMs:
 
 ## Source layout
 
