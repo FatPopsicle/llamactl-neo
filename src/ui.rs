@@ -756,6 +756,26 @@ impl<'a> App<'a> {
             }
             8 => self.cfg.advertise_base_models = !self.cfg.advertise_base_models,
             9 => self.cfg.advertise_profiles = !self.cfg.advertise_profiles,
+            10 => {
+                let enable = !crate::service_enabled();
+                let paths = self.paths.clone();
+                self.spawn_task(
+                    if enable {
+                        "enabling start on boot"
+                    } else {
+                        "disabling start on boot"
+                    },
+                    move || {
+                        crate::set_start_on_boot(&paths, enable)?;
+                        Ok(if enable {
+                            "Start on boot enabled".into()
+                        } else {
+                            "Start on boot disabled".into()
+                        })
+                    },
+                );
+                return;
+            }
             _ => {
                 self.notice = "This setting requires a typed value; use `llamactl config`".into();
                 return;
@@ -4028,6 +4048,15 @@ fn settings(c: &Config) -> Vec<(String, String)> {
         (
             "Advertise profiles".into(),
             if c.advertise_profiles {
+                "enabled"
+            } else {
+                "disabled"
+            }
+            .into(),
+        ),
+        (
+            "Start on boot".into(),
+            if crate::service_enabled() {
                 "enabled"
             } else {
                 "disabled"

@@ -236,7 +236,7 @@ llamactl install-service
 systemctl --user enable --now llamactl.service llamactl-update.timer
 ```
 
-The service runs the llama-swap catalog. The timer checks for runtime updates daily and restarts the server when necessary.
+The service runs the llama-swap catalog. The timer checks for runtime updates daily and restarts the server when necessary. You can also toggle **Start on boot** from llamactl's Settings page; this installs and enables the server service (but not the optional update timer).
 
 Inspect it with:
 

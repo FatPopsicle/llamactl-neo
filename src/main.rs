@@ -622,6 +622,30 @@ fn refresh_swap(c: &Config, p: &Paths) -> Result<()> {
     Ok(())
 }
 
+pub fn service_enabled() -> bool {
+    directories::BaseDirs::new()
+        .map(|base| {
+            base.home_dir()
+                .join(".config/systemd/user/default.target.wants/llamactl.service")
+                .exists()
+        })
+        .unwrap_or(false)
+}
+
+pub fn set_start_on_boot(p: &Paths, enabled: bool) -> Result<()> {
+    if enabled {
+        install_service(p)?;
+    }
+    let action = if enabled { "enable" } else { "disable" };
+    let status = Command::new("systemctl")
+        .args(["--user", action, "llamactl.service"])
+        .status()?;
+    if !status.success() {
+        bail!("systemctl --user {action} llamactl.service failed with {status}")
+    }
+    Ok(())
+}
+
 pub fn install_service(p: &Paths) -> Result<()> {
     let home = directories::BaseDirs::new()
         .context("home unavailable")?
