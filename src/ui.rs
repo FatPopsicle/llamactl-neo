@@ -4074,6 +4074,27 @@ fn compute_profile_estimates(
     let _ = tx.send(ProfileEstimateUpdate::Done);
 }
 
+fn latest_gpu_samples(payload: &Value) -> Vec<&Value> {
+    // The llamactl sidecar already returns one current sample per device.
+    if let Some(gpus) = payload.get("gpus").and_then(Value::as_array) {
+        return gpus.iter().collect();
+    }
+    // llama-swap's /api/performance response is a time series. Keep only the
+    // newest sample for each device instead of treating every sample as a GPU.
+    let mut latest = BTreeMap::new();
+    for sample in payload
+        .get("gpu_stats")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(id) = sample.get("id").and_then(Value::as_u64) {
+            latest.insert(id, sample);
+        }
+    }
+    latest.into_values().collect()
+}
+
 fn system_telemetry(cfg: &Config) -> Telemetry {
     let text = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let mem = |name: &str| {
@@ -4091,34 +4112,51 @@ fn system_telemetry(cfg: &Config) -> Telemetry {
         ram_total,
         ..Telemetry::default()
     };
-    if let Ok(payload) = reqwest::blocking::Client::builder()
+    if let Ok(client) = reqwest::blocking::Client::builder()
         .timeout(Duration::from_millis(500))
         .build()
-        .and_then(|client| {
-            client
-                .get(format!("http://{}:{}/api/performance", cfg.host, cfg.port))
-                .send()
-        })
-        .and_then(|response| response.json::<Value>())
-        && let Some(gpus) = payload.get("gpu_stats").and_then(Value::as_array)
-        && !gpus.is_empty()
     {
-        for gpu in gpus {
-            let used = gpu
-                .get("mem_used_mb")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-            let total = gpu
-                .get("mem_total_mb")
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0);
-            telemetry.vram_used += (used * 1024.0 * 1024.0) as u64;
-            telemetry.vram_total += (total * 1024.0 * 1024.0) as u64;
-            if let Some(temp) = gpu.get("temp_c").and_then(Value::as_f64) {
-                telemetry.gpu_temps.push(temp);
+        let api_key = cfg.keys().into_iter().next();
+        let endpoints = [
+            format!(
+                "http://{}:{}/api/llamactl/telemetry",
+                cfg.host, cfg.telemetry_port
+            ),
+            format!("http://{}:{}/api/performance", cfg.host, cfg.port),
+        ];
+        for endpoint in endpoints {
+            let mut request = client.get(endpoint);
+            if let Some(key) = &api_key {
+                request = request.bearer_auth(key);
             }
+            let Ok(payload) = request
+                .send()
+                .and_then(|response| response.error_for_status())
+                .and_then(|response| response.json::<Value>())
+            else {
+                continue;
+            };
+            let gpus = latest_gpu_samples(&payload);
+            if gpus.is_empty() {
+                continue;
+            }
+            for gpu in gpus {
+                let used = gpu
+                    .get("mem_used_mb")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                let total = gpu
+                    .get("mem_total_mb")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                telemetry.vram_used += (used * 1024.0 * 1024.0) as u64;
+                telemetry.vram_total += (total * 1024.0 * 1024.0) as u64;
+                if let Some(temp) = gpu.get("temp_c").and_then(Value::as_f64) {
+                    telemetry.gpu_temps.push(temp);
+                }
+            }
+            return telemetry;
         }
-        return telemetry;
     }
     if let Ok(output) = Command::new("nvidia-smi")
         .args([
@@ -4415,6 +4453,49 @@ fn serving_telemetry(cfg: &Config, paths: &Paths) -> Telemetry {
         }
     }
     telemetry
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn performance_history_keeps_only_latest_sample_per_gpu() {
+        let payload = json!({"gpu_stats": [
+            {"id": 0, "timestamp": "old", "mem_total_mb": 100, "temp_c": 40},
+            {"id": 1, "timestamp": "old", "mem_total_mb": 200, "temp_c": 41},
+            {"id": 0, "timestamp": "new", "mem_total_mb": 100, "temp_c": 50},
+            {"id": 1, "timestamp": "new", "mem_total_mb": 200, "temp_c": 51}
+        ]});
+        let samples = latest_gpu_samples(&payload);
+        assert_eq!(samples.len(), 2);
+        assert_eq!(
+            samples[0].get("timestamp").and_then(Value::as_str),
+            Some("new")
+        );
+        assert_eq!(
+            samples[1].get("timestamp").and_then(Value::as_str),
+            Some("new")
+        );
+    }
+
+    #[test]
+    fn compact_sidecar_gpu_samples_are_used_directly() {
+        let payload = json!({"gpus": [
+            {"id": 0, "mem_total_mb": 100},
+            {"id": 1, "mem_total_mb": 200}
+        ]});
+        let samples = latest_gpu_samples(&payload);
+        assert_eq!(samples.len(), 2);
+        assert_eq!(
+            samples
+                .iter()
+                .filter_map(|gpu| gpu.get("mem_total_mb").and_then(Value::as_u64))
+                .sum::<u64>(),
+            300
+        );
+    }
 }
 
 #[cfg(test)]

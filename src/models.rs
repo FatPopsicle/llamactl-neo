@@ -1086,32 +1086,40 @@ pub enum DraftCompatibility {
     Unknown(String),
 }
 
-pub fn draft_compatibility(main: &Path, draft: &Path) -> DraftCompatibility {
-    if main == draft {
-        return DraftCompatibility::Incompatible("draft is the main model".into());
-    }
-    let main_bytes = model_bytes(main);
-    let draft_bytes = model_bytes(draft);
-    if draft_bytes == 0 || main_bytes as f64 / (draft_bytes as f64) < 1.4 {
-        return DraftCompatibility::Incompatible(
-            "draft must be at least 1.4× smaller than the main model".into(),
-        );
-    }
-    let Some(main_meta) = basic_gguf_metadata(main) else {
-        return DraftCompatibility::Unknown("main GGUF metadata unavailable".into());
-    };
-    let Some(draft_meta) = basic_gguf_metadata(draft) else {
-        return DraftCompatibility::Unknown("draft GGUF metadata unavailable".into());
-    };
-    let (Some(main_vocab), Some(draft_vocab)) = (main_meta.tokenizer, draft_meta.tokenizer) else {
-        return DraftCompatibility::Unknown("tokenizer vocabulary metadata unavailable".into());
-    };
-    if main_vocab.bos_token_id != draft_vocab.bos_token_id
-        || main_vocab.eos_token_id != draft_vocab.eos_token_id
-        || main_vocab.add_bos_token != draft_vocab.add_bos_token
-        || main_vocab.add_eos_token != draft_vocab.add_eos_token
-    {
-        return DraftCompatibility::Incompatible("BOS/EOS tokenizer settings differ".into());
+fn draft_tokenizer_compatibility(
+    main_vocab: &TokenizerMetadata,
+    draft_vocab: &TokenizerMetadata,
+) -> DraftCompatibility {
+    // llama.cpp only compares a special token ID when that token is configured
+    // to be added. GGUFs can legitimately use different EOS IDs while both
+    // have add_eos_token=false.
+    for (name, main_add, draft_add, main_id, draft_id) in [
+        (
+            "BOS",
+            main_vocab.add_bos_token,
+            draft_vocab.add_bos_token,
+            main_vocab.bos_token_id,
+            draft_vocab.bos_token_id,
+        ),
+        (
+            "EOS",
+            main_vocab.add_eos_token,
+            draft_vocab.add_eos_token,
+            main_vocab.eos_token_id,
+            draft_vocab.eos_token_id,
+        ),
+    ] {
+        if matches!((main_add, draft_add), (Some(main), Some(draft)) if main != draft) {
+            return DraftCompatibility::Incompatible(format!(
+                "{name} tokenizer add settings differ"
+            ));
+        }
+        if main_add == Some(true)
+            && draft_add == Some(true)
+            && matches!((main_id, draft_id), (Some(main), Some(draft)) if main != draft)
+        {
+            return DraftCompatibility::Incompatible(format!("{name} tokenizer token IDs differ"));
+        }
     }
     if main_vocab.token_count.abs_diff(draft_vocab.token_count) > 128 {
         return DraftCompatibility::Incompatible(format!(
@@ -1132,6 +1140,22 @@ pub fn draft_compatibility(main: &Path, draft: &Path) -> DraftCompatibility {
         }
         _ => DraftCompatibility::Unknown("tokenizer prefix hash unavailable".into()),
     }
+}
+
+pub fn draft_compatibility(main: &Path, draft: &Path) -> DraftCompatibility {
+    if main == draft {
+        return DraftCompatibility::Incompatible("draft is the main model".into());
+    }
+    let Some(main_meta) = basic_gguf_metadata(main) else {
+        return DraftCompatibility::Unknown("main GGUF metadata unavailable".into());
+    };
+    let Some(draft_meta) = basic_gguf_metadata(draft) else {
+        return DraftCompatibility::Unknown("draft GGUF metadata unavailable".into());
+    };
+    let (Some(main_vocab), Some(draft_vocab)) = (main_meta.tokenizer, draft_meta.tokenizer) else {
+        return DraftCompatibility::Unknown("tokenizer vocabulary metadata unavailable".into());
+    };
+    draft_tokenizer_compatibility(&main_vocab, &draft_vocab)
 }
 pub fn has_mtp(path: &Path) -> bool {
     gguf_metadata(path).is_some_and(|metadata| {
@@ -1219,6 +1243,46 @@ mod tests {
         let before = models_fingerprint(&cfg);
         fs::write(&path, b"GGUF changed").unwrap();
         assert_ne!(before, models_fingerprint(&cfg));
+    }
+
+    fn test_vocab(eos: u64, add_eos: bool) -> TokenizerMetadata {
+        TokenizerMetadata {
+            token_count: 10,
+            prefix_hashes: BTreeMap::from([(10, "same-vocabulary".into())]),
+            eos_token_id: Some(eos),
+            add_eos_token: Some(add_eos),
+            ..TokenizerMetadata::default()
+        }
+    }
+
+    #[test]
+    fn draft_allows_unused_eos_ids_to_differ() {
+        let main = test_vocab(106, false);
+        let draft = test_vocab(1, false);
+        assert_eq!(
+            draft_tokenizer_compatibility(&main, &draft),
+            DraftCompatibility::Compatible
+        );
+    }
+
+    #[test]
+    fn draft_rejects_different_eos_id_when_eos_is_added() {
+        let main = test_vocab(106, true);
+        let draft = test_vocab(1, true);
+        assert!(matches!(
+            draft_tokenizer_compatibility(&main, &draft),
+            DraftCompatibility::Incompatible(reason) if reason.contains("EOS")
+        ));
+    }
+
+    #[test]
+    fn draft_rejects_different_special_token_add_settings() {
+        let main = test_vocab(1, true);
+        let draft = test_vocab(1, false);
+        assert!(matches!(
+            draft_tokenizer_compatibility(&main, &draft),
+            DraftCompatibility::Incompatible(reason) if reason.contains("EOS")
+        ));
     }
 }
 
