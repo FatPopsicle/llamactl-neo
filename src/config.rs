@@ -82,6 +82,17 @@ pub struct Config {
     pub gpu_layers: Value,
     pub ctx_size: u64,
     pub extra_args: Vec<String>,
+    /// Shell script sourced before the runtime binary is exec'd.
+    ///
+    /// Some backends cannot run from a bare exec: a SYCL build needs oneAPI's
+    /// `setvars.sh` on the environment, and without it `llama-server` aborts
+    /// with "No device of requested type available" — which looks like absent
+    /// hardware rather than a missing environment. LD_LIBRARY_PATH alone is not
+    /// enough; setvars sets considerably more than that.
+    ///
+    /// Empty means exec the binary directly, which is the behaviour every
+    /// self-contained build wants.
+    pub runtime_env_file: String,
     pub auto_update: bool,
     pub keep_versions: usize,
     pub swap_ttl: u64,
@@ -123,6 +134,7 @@ impl Default for Config {
             gpu_layers: Value::String("all".into()),
             ctx_size: 4096,
             extra_args: vec![],
+            runtime_env_file: String::new(),
             auto_update: true,
             keep_versions: 2,
             swap_ttl: 600,

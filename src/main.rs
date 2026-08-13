@@ -1,4 +1,5 @@
 mod config;
+mod drm;
 mod models;
 mod process;
 mod profiles;

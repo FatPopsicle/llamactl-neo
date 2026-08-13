@@ -4095,6 +4095,57 @@ fn latest_gpu_samples(payload: &Value) -> Vec<&Value> {
     latest.into_values().collect()
 }
 
+/// Runtime-reported (total, free) device memory, cached briefly.
+///
+/// Unlike capacity this genuinely changes, so it cannot be cached for the
+/// process lifetime — but it costs a subprocess, and telemetry is polled on a
+/// timer, so re-running it on every tick would fork `llama-server` several
+/// times a second. A few seconds of staleness is the right trade for a number
+/// that is only consulted while idle.
+fn runtime_device_memory() -> Option<(u64, u64)> {
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<(std::time::Instant, Option<(u64, u64)>)>> = Mutex::new(None);
+    const TTL: Duration = Duration::from_secs(5);
+
+    let mut guard = CACHE.lock().ok()?;
+    if let Some((stamp, value)) = guard.as_ref()
+        && stamp.elapsed() < TTL
+    {
+        return *value;
+    }
+    let fresh = crate::process::device_memory_bytes();
+    *guard = Some((std::time::Instant::now(), fresh));
+    fresh
+}
+
+/// Card capacity in bytes, cached for the process lifetime.
+///
+/// fdinfo reports usage but never capacity — the DRM usage-stats interface has
+/// no such field. amdgpu publishes `mem_info_vram_total` in sysfs; xe and i915
+/// publish nothing equivalent, so on Intel we fall back to asking the runtime
+/// itself via `llama-server --list-devices`, whose `(TOTAL MiB, FREE MiB free)`
+/// format is emitted by llama.cpp's common code and is therefore identical
+/// across CUDA, ROCm, Vulkan and SYCL.
+///
+/// Cached because that fallback spawns a subprocess and telemetry is polled on
+/// a timer. Capacity is unlikely to change while a runtime is loaded — though
+/// it is not impossible: PCIe hotplug, SR-IOV VFs appearing or disappearing,
+/// and passthrough changes inside a container can all move it.
+///
+/// Note: It *is* backend-dependent, though: the same Arc B70 reports 32656 MiB
+/// under Vulkan and 31023 MiB under SYCL. Switching backend therefore needs a
+/// restart before the figure is right again.
+fn vram_capacity_bytes() -> u64 {
+    static CAPACITY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CAPACITY.get_or_init(|| {
+        let sysfs = crate::drm::device_total_bytes();
+        if sysfs > 0 {
+            return sysfs;
+        }
+        crate::process::installed_vram_bytes()
+    })
+}
+
 fn system_telemetry(cfg: &Config) -> Telemetry {
     let text = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let mem = |name: &str| {
@@ -4158,6 +4209,34 @@ fn system_telemetry(cfg: &Config) -> Telemetry {
             return telemetry;
         }
     }
+    // DRM fdinfo: the only cross-vendor memory interface in the kernel, and on
+    // Intel the only VRAM source that exists at all — sysfs publishes no counter,
+    // the xe PMU exposes engines and clocks only, and debugfs is unavailable in a
+    // container. Tried before nvidia-smi so non-NVIDIA hardware reports something
+    // instead of zero; on an NVIDIA box this yields nothing and we fall through.
+
+    // Tier 1 — DRM fdinfo. Exact, per-process, no subprocess, vendor-neutral.
+    // Only sees clients that exist, so it reads zero before anything is loaded.
+    let drm = crate::drm::read();
+    let drm_used = drm.total_allocated();
+    if drm_used > 0 {
+        telemetry.vram_used += drm_used;
+        telemetry.vram_total += vram_capacity_bytes();
+        telemetry.gpu_temps.extend(crate::drm::temperatures());
+        return telemetry;
+    }
+
+    // Tier 2 — ask the runtime. This is the idle case: nothing of ours is
+    // loaded, so fdinfo has nothing to report, but the card is not necessarily
+    // empty. The driver's own view is what a fit calculation needs here.
+    if let Some((total, free)) = runtime_device_memory() {
+        telemetry.vram_used += total.saturating_sub(free);
+        telemetry.vram_total += total;
+        telemetry.gpu_temps.extend(crate::drm::temperatures());
+        return telemetry;
+    }
+
+    // Tier 3 — nvidia-smi, below.
     if let Ok(output) = Command::new("nvidia-smi")
         .args([
             "--query-gpu=memory.used,memory.total,temperature.gpu",
