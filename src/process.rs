@@ -37,7 +37,27 @@ pub fn pid(paths: &Paths) -> Option<u32> {
 }
 
 fn runtime_command(binary: &Path, paths: &Paths) -> Command {
-    let mut command = Command::new(binary);
+    // A runtime that needs an environment script cannot simply be exec'd. Wrap
+    // it in a shell that sources the script first, then execs the binary so no
+    // extra process is left in the tree and signals/exit codes pass through
+    // unchanged. Arguments appended by callers land in "$@" after the shift.
+    let env_file = Config::load(paths)
+        .ok()
+        .map(|cfg| cfg.runtime_env_file)
+        .filter(|path| !path.is_empty());
+    let mut command = match env_file {
+        Some(env_file) => {
+            let mut shell = Command::new("bash");
+            shell
+                .arg("-c")
+                .arg(r#"source "$1" >/dev/null 2>&1; shift; exec "$@""#)
+                .arg("llamactl")
+                .arg(env_file)
+                .arg(binary);
+            shell
+        }
+        None => Command::new(binary),
+    };
     let runtime_binary = if binary == paths.swap_bin || binary == Path::new("/usr/bin/env") {
         server_binary(paths).unwrap_or_else(|| paths.current.join("llama-server"))
     } else {
@@ -109,7 +129,7 @@ pub fn server_help(paths: &Paths) -> Result<String> {
 static FLAG_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"--([A-Za-z0-9][A-Za-z0-9-]*)").unwrap());
 static VRAM_DEVICE_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"\((\d+)\s+MiB,\s+\d+\s+MiB free\)").unwrap());
+    LazyLock::new(|| regex::Regex::new(r"\((\d+)\s+MiB,\s+(\d+)\s+MiB free\)").unwrap());
 
 pub fn known_flags(paths: &Paths) -> Option<BTreeSet<String>> {
     let text = server_help(paths).ok()?;
@@ -691,7 +711,42 @@ fn append_scheduler_matrix(
     Ok(())
 }
 
-fn installed_vram_bytes() -> u64 {
+/// Total and free device memory, as reported by the runtime itself.
+///
+/// `llama-server --list-devices` prints `(TOTAL MiB, FREE MiB free)` from
+/// llama.cpp's common code, so the format is identical across CUDA, ROCm,
+/// Vulkan and SYCL. Both numbers are summed across devices.
+///
+/// This is the only usage source that works with *nothing loaded*: DRM fdinfo
+/// can only report clients that exist, so before the first model starts it
+/// legitimately reads zero — which is indistinguishable from "the card is
+/// empty" even when another process holds memory we cannot see.
+///
+/// ⚠️ `free` is backend-dependent and not directly comparable to fdinfo. On the
+/// same idle Arc B70 pair, SYCL reports the cards as entirely free while Vulkan
+/// reports ~3.2 GiB already in use. Treat it as a fallback, not a cross-check.
+pub fn device_memory_bytes() -> Option<(u64, u64)> {
+    let paths = Paths::discover().ok()?;
+    let binary = server_binary(&paths).unwrap_or_else(|| paths.current.join("llama-server"));
+    let output = runtime_command(&binary, &paths)
+        .arg("--list-devices")
+        .output()
+        .ok()?;
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut total = 0u64;
+    let mut free = 0u64;
+    for capture in VRAM_DEVICE_RE.captures_iter(&text) {
+        total += capture[1].parse::<u64>().ok()? * 1024 * 1024;
+        free += capture[2].parse::<u64>().ok()? * 1024 * 1024;
+    }
+    (total > 0).then_some((total, free))
+}
+
+pub fn installed_vram_bytes() -> u64 {
     if let Ok(paths) = Paths::discover()
         && let Some(binary) = server_binary(&paths)
         && let Ok(output) = runtime_command(&binary, &paths)
@@ -1007,5 +1062,22 @@ mod tests {
         let sets = maximal_fitting_sets(&estimates, 20, 2);
         assert_eq!(sets.len(), estimates.len() * (estimates.len() - 1) / 2);
         assert!(sets.iter().all(|set| set.len() == 2));
+    }
+}
+
+#[cfg(test)]
+mod capacity_live {
+    /// Manual check — runs the real runtime binary, so #[ignore]d.
+    /// `cargo test --release -- --ignored --nocapture capacity_live`
+    #[test]
+    #[ignore]
+    fn reports_installed_vram() {
+        let bytes = super::installed_vram_bytes();
+        println!("device_memory_bytes: {:?}", super::device_memory_bytes().map(|(t,f)| (t >> 30, f >> 30)));
+        println!(
+            "installed_vram_bytes: {} bytes = {:.2} GiB",
+            bytes,
+            bytes as f64 / (1u64 << 30) as f64
+        );
     }
 }
