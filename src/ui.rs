@@ -57,7 +57,7 @@ struct App<'a> {
     models: Vec<models::Model>,
     models_fingerprint: Option<u64>,
     scan_rx: Option<std::sync::mpsc::Receiver<(u64, Option<Vec<models::Model>>)>>,
-    estimate_rx: Option<std::sync::mpsc::Receiver<BTreeMap<String, (f64, f64)>>>,
+    estimate_rx: Option<std::sync::mpsc::Receiver<ProfileEstimateUpdate>>,
     estimate_target: Option<String>,
     telemetry_rx: Option<std::sync::mpsc::Receiver<(Telemetry, Telemetry)>>,
     last_check: Option<UpdateStatus>,
@@ -86,6 +86,7 @@ struct Telemetry {
     total_output_tokens: u64,
     total_cache_tokens: u64,
     last_request: Option<RequestPerformance>,
+    historical_tok_s: BTreeMap<String, f64>,
     active_requests: usize,
     model_name: String,
     model_state: ModelState,
@@ -279,6 +280,11 @@ enum EstimateState {
     Ready(models::Estimate),
 }
 
+enum ProfileEstimateUpdate {
+    Estimate(String, (f64, f64)),
+    Done,
+}
+
 struct BackgroundTask {
     label: String,
     rx: std::sync::mpsc::Receiver<Result<String>>,
@@ -406,18 +412,31 @@ impl<'a> App<'a> {
         let models = self.models.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(compute_profile_estimates(&cfg, &profiles, &models));
+            compute_profile_estimates(&cfg, &profiles, &models, &tx);
         });
         self.estimate_rx = Some(rx);
         self.estimate_target = Some(fingerprint);
     }
     fn poll_estimates(&mut self) {
-        let result = self.estimate_rx.as_ref().and_then(|rx| rx.try_recv().ok());
-        if let Some(estimates) = result {
-            self.estimate_rx = None;
-            if let Some(target) = self.estimate_target.take() {
-                self.profile_estimates = estimates;
-                self.profile_fingerprint = target;
+        loop {
+            let result = self.estimate_rx.as_ref().map(|rx| rx.try_recv());
+            match result {
+                Some(Ok(ProfileEstimateUpdate::Estimate(name, estimate))) => {
+                    self.profile_estimates.insert(name, estimate);
+                }
+                Some(Ok(ProfileEstimateUpdate::Done)) => {
+                    self.estimate_rx = None;
+                    if let Some(target) = self.estimate_target.take() {
+                        self.profile_fingerprint = target;
+                    }
+                    break;
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                    self.estimate_rx = None;
+                    self.estimate_target = None;
+                    break;
+                }
+                Some(Err(std::sync::mpsc::TryRecvError::Empty)) | None => break,
             }
         }
     }
@@ -490,6 +509,8 @@ impl<'a> App<'a> {
         telemetry.total_output_tokens = serving.total_output_tokens;
         telemetry.total_cache_tokens = serving.total_cache_tokens;
         telemetry.last_request = serving.last_request.clone();
+        self.last_tok.extend(serving.historical_tok_s.clone());
+        telemetry.historical_tok_s = serving.historical_tok_s.clone();
         telemetry.model_name = serving.model_name.clone();
         telemetry.model_state = serving.model_state;
         telemetry.llama_cpp_version = serving.llama_cpp_version;
@@ -4019,10 +4040,15 @@ fn compute_profile_estimates(
     cfg: &Config,
     profiles: &Profiles,
     models: &[models::Model],
-) -> BTreeMap<String, (f64, f64)> {
+    tx: &std::sync::mpsc::Sender<ProfileEstimateUpdate>,
+) {
     let gib = (1u64 << 30) as f64;
-    let mut out = BTreeMap::new();
-    for name in profiles.profiles.keys() {
+    // Tensor-placement overrides require scanning large tensor directories. Do
+    // the inexpensive profiles first and stream every result to the UI instead
+    // of withholding the whole table until the slowest model is finished.
+    let mut names = profiles.profiles.keys().collect::<Vec<_>>();
+    names.sort_by_key(|name| profiles.profiles[*name].contains_key("override-tensor"));
+    for name in names {
         let Some(owner) = profiles.owner(name) else {
             continue;
         };
@@ -4035,9 +4061,17 @@ fn compute_profile_estimates(
         let mut full = process::common_args(cfg);
         full.extend(args);
         let est = models::estimate(&model.path, &full);
-        out.insert(name.clone(), (est.vram as f64 / gib, est.ram as f64 / gib));
+        if tx
+            .send(ProfileEstimateUpdate::Estimate(
+                name.clone(),
+                (est.vram as f64 / gib, est.ram as f64 / gib),
+            ))
+            .is_err()
+        {
+            return;
+        }
     }
-    out
+    let _ = tx.send(ProfileEstimateUpdate::Done);
 }
 
 fn system_telemetry(cfg: &Config) -> Telemetry {
@@ -4194,7 +4228,7 @@ fn serving_telemetry(cfg: &Config, paths: &Paths) -> Telemetry {
     }
     if swap_detected
         && let Ok(response) = headers(client.get(format!(
-            "{base}/api/metrics/activity?page=1&limit=1&sort=timestamp&order=desc"
+            "{base}/api/metrics/activity?page=1&limit=999&order=desc"
         )))
         .send()
         && response.status().is_success()
@@ -4248,6 +4282,28 @@ fn serving_telemetry(cfg: &Config, paths: &Paths) -> Telemetry {
                 .and_then(Value::as_f64),
             duration_ms: last.get("duration_ms").and_then(Value::as_u64).unwrap_or(0),
         });
+        // llama-swap retains activity across model unloads and manager restarts.
+        // Keep the newest measured generation rate for every advertised model.
+        for request in activity
+            .get("data")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(model) = request.get("model").and_then(Value::as_str) else {
+                continue;
+            };
+            let tokens = request.get("tokens").unwrap_or(request);
+            let Some(rate) = tokens.get("tokens_per_second").and_then(Value::as_f64) else {
+                continue;
+            };
+            if rate > 0.0 {
+                telemetry
+                    .historical_tok_s
+                    .entry(model.to_owned())
+                    .or_insert(rate);
+            }
+        }
     }
     if swap_detected
         && let Ok(response) = headers(client.get(format!("{base}/api/metrics/stats"))).send()
