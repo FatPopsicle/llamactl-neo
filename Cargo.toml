@@ -1,0 +1,32 @@
+[package]
+name = "llamactl"
+version = "0.17.0"
+edition = "2024"
+description = "Native llama.cpp runtime manager with a Ratatui interface"
+license = "MIT"
+
+[[bin]]
+name = "llamactl"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.28"
+directories = "6.0"
+flate2 = "1.0"
+ratatui = "0.29"
+regex = "1.11"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tar = "0.4"
+tempfile = "3.15"
+walkdir = "2.5"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = "symbols"
