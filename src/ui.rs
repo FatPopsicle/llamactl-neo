@@ -1,7 +1,7 @@
 use crate::{
     benchmark,
     config::{Config, Paths},
-    models, process, profiles,
+    huggingface, models, process, profiles, templates,
     profiles::Profiles,
 };
 use anyhow::Result;
@@ -18,16 +18,18 @@ use ratatui::{
     symbols::border,
     text::{Line, Span},
     widgets::{
-        Block, BorderType, Borders, Clear, Gauge, List, ListItem, ListState, Padding, Paragraph,
-        Row, Table, Wrap,
+        Block, BorderType, Borders, Clear, Gauge, HighlightSpacing, List, ListItem, ListState,
+        Padding, Paragraph, Row, Table, Wrap,
     },
 };
+use regex::Regex;
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, VecDeque},
     fs, io,
     path::PathBuf,
     process::Command,
+    sync::LazyLock,
     time::{Duration, Instant},
 };
 use throbber_widgets_tui::{Throbber, ThrobberState};
@@ -36,7 +38,9 @@ use tui_checkbox::Checkbox;
 const PAGES: &[&str] = &[
     "Dashboard",
     "Models",
+    "Templates",
     "Profiles",
+    "Search",
     "Settings",
     "Logs",
     "Maintenance",
@@ -60,7 +64,14 @@ struct App<'a> {
     benchmark_view: Option<BenchmarkView>,
     benchmark_dialog: Option<BenchmarkDialog>,
     runtime_picker: Option<RuntimePicker>,
+    template_picker: Option<TemplatePicker>,
     background: Option<BackgroundTask>,
+    hf: HfBrowser,
+    hf_download: Option<HfDownloadDialog>,
+    templates: templates::Templates,
+    template_editor: Option<TemplateEditor>,
+    template_name_input: Option<TemplateNameInput>,
+    template_delete_confirm: Option<String>,
     last_tok: BTreeMap<String, f64>,
     profile_estimates: BTreeMap<String, (f64, f64)>,
     profile_fingerprint: String,
@@ -146,6 +157,11 @@ struct RuntimePicker {
     selected: usize,
 }
 
+struct TemplatePicker {
+    options: Vec<String>,
+    selected: usize,
+}
+
 struct BenchmarkView {
     runs: Vec<benchmark::BenchmarkRun>,
 }
@@ -163,6 +179,9 @@ enum BenchmarkDialog {
         runtime: String,
         effective_context: Option<u64>,
         load_ms: Option<u64>,
+        benchmark_started_at: Instant,
+        case_started_at: Option<Instant>,
+        case_elapsed: Duration,
         completed: Vec<benchmark::BenchmarkCase>,
     },
 }
@@ -292,7 +311,6 @@ enum EditorField {
     Reasoning,
     Jinja,
     ChatTemplate,
-    ChatTemplateFile,
     ChatTemplateKwargs,
 }
 
@@ -332,6 +350,292 @@ struct BackgroundTask {
     rx: std::sync::mpsc::Receiver<Result<String>>,
 }
 
+#[derive(Default)]
+struct HfBrowser {
+    query: String,
+    cursor: usize,
+    editing: bool,
+    search_templates: bool,
+    repositories: Vec<huggingface::Repository>,
+    repository: Option<huggingface::Repository>,
+    artifacts: Vec<huggingface::Artifact>,
+    template_hits: Vec<huggingface::TemplateHit>,
+    template_view: Option<TemplateView>,
+    details: Option<huggingface::ModelDetails>,
+    details_open: bool,
+    detail_scroll: u16,
+    request_rx: Option<std::sync::mpsc::Receiver<Result<HfRequestResult>>>,
+    destination: usize,
+    confirm: Option<HfDownloadSelection>,
+}
+
+enum HfRequestResult {
+    Repositories(Vec<huggingface::Repository>),
+    Templates(Vec<huggingface::TemplateHit>),
+    Artifacts {
+        repository: huggingface::Repository,
+        artifacts: Vec<huggingface::Artifact>,
+        details: huggingface::ModelDetails,
+    },
+    Details(huggingface::ModelDetails),
+}
+
+struct HfDownloadSelection {
+    repository: huggingface::Repository,
+    artifact: huggingface::Artifact,
+    destination: PathBuf,
+}
+
+struct HfDownloadDialog {
+    repository: String,
+    destination: PathBuf,
+    files: BTreeMap<String, u64>,
+    progress: BTreeMap<String, u64>,
+    baseline: BTreeMap<String, u64>,
+    events: std::sync::mpsc::Receiver<huggingface::DownloadEvent>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    current: String,
+    phase: String,
+    retry: Option<String>,
+    started_at: Instant,
+    completed_files: usize,
+    cancelling: bool,
+}
+
+enum HfInputAction {
+    None,
+    Submit,
+    Cancel,
+}
+
+#[derive(Clone)]
+struct TemplateView {
+    id: String,
+    template: String,
+    scroll: u16,
+}
+
+struct TemplateEditor {
+    name: String,
+    lines: Vec<String>,
+    line: usize,
+    col: usize,
+    is_new: bool,
+}
+
+impl TemplateEditor {
+    fn new(name: String, text: String, is_new: bool) -> Self {
+        let lines = if text.is_empty() {
+            vec![String::new()]
+        } else {
+            text.split('\n').map(str::to_owned).collect()
+        };
+        Self {
+            name,
+            lines,
+            line: 0,
+            col: 0,
+            is_new,
+        }
+    }
+
+    fn text(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    fn line_len(&self, line: usize) -> usize {
+        self.lines.get(line).map(|l| l.chars().count()).unwrap_or(0)
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        if ch == '\n' {
+            let byte = char_byte_index(&self.lines[self.line], self.col);
+            let rest = self.lines[self.line].split_off(byte);
+            self.lines.insert(self.line + 1, rest);
+            self.line += 1;
+            self.col = 0;
+        } else {
+            let byte = char_byte_index(&self.lines[self.line], self.col);
+            self.lines[self.line].insert(byte, ch);
+            self.col += 1;
+        }
+    }
+
+    fn backspace(&mut self) {
+        if self.col > 0 {
+            let byte = char_byte_index(&self.lines[self.line], self.col - 1);
+            self.lines[self.line].remove(byte);
+            self.col -= 1;
+        } else if self.line > 0 {
+            let previous = self.lines.remove(self.line);
+            self.line -= 1;
+            self.col = self.lines[self.line].chars().count();
+            self.lines[self.line].push_str(&previous);
+        }
+    }
+
+    fn delete(&mut self) {
+        let len = self.line_len(self.line);
+        if self.col < len {
+            let byte = char_byte_index(&self.lines[self.line], self.col);
+            self.lines[self.line].remove(byte);
+        } else if self.line + 1 < self.lines.len() {
+            let next = self.lines.remove(self.line + 1);
+            self.lines[self.line].push_str(&next);
+        }
+    }
+
+    fn move_left(&mut self) {
+        if self.col > 0 {
+            self.col -= 1;
+        } else if self.line > 0 {
+            self.line -= 1;
+            self.col = self.line_len(self.line);
+        }
+    }
+
+    fn move_right(&mut self) {
+        if self.col < self.line_len(self.line) {
+            self.col += 1;
+        } else if self.line + 1 < self.lines.len() {
+            self.line += 1;
+            self.col = 0;
+        }
+    }
+
+    fn move_up(&mut self) {
+        if self.line > 0 {
+            self.line -= 1;
+            self.col = self.col.min(self.line_len(self.line));
+        }
+    }
+
+    fn move_down(&mut self) {
+        if self.line + 1 < self.lines.len() {
+            self.line += 1;
+            self.col = self.col.min(self.line_len(self.line));
+        }
+    }
+
+    fn move_home(&mut self) {
+        self.col = 0;
+    }
+
+    fn move_end(&mut self) {
+        self.col = self.line_len(self.line);
+    }
+}
+
+struct TemplateNameInput {
+    text: String,
+    cursor: usize,
+    rename: Option<String>,
+}
+
+impl HfBrowser {
+    fn handle_input(&mut self, key: KeyEvent) -> HfInputAction {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => return HfInputAction::Cancel,
+            KeyCode::Enter => return HfInputAction::Submit,
+            KeyCode::Left if ctrl => self.move_word(-1),
+            KeyCode::Right if ctrl => self.move_word(1),
+            KeyCode::Left => self.move_cursor(-1),
+            KeyCode::Right => self.move_cursor(1),
+            KeyCode::Home => self.cursor = 0,
+            KeyCode::Char('a') if ctrl => self.cursor = 0,
+            KeyCode::End => self.cursor = self.query.chars().count(),
+            KeyCode::Char('e') if ctrl => self.cursor = self.query.chars().count(),
+            KeyCode::Backspace => self.backspace(),
+            KeyCode::Char('h') if ctrl => self.backspace(),
+            KeyCode::Delete => self.delete(),
+            KeyCode::Char('u') if ctrl => self.clear_to_start(),
+            KeyCode::Char('k') if ctrl => self.clear_to_end(),
+            KeyCode::Char('w') if ctrl => self.delete_word_before(),
+            KeyCode::Char(character) if !character.is_control() => self.insert(character),
+            _ => {}
+        }
+        HfInputAction::None
+    }
+
+    fn move_cursor(&mut self, delta: i32) {
+        let len = self.query.chars().count() as i32;
+        self.cursor = (self.cursor as i32 + delta).clamp(0, len) as usize;
+    }
+
+    fn move_word(&mut self, direction: i32) {
+        let chars = self.query.chars().collect::<Vec<_>>();
+        if direction < 0 {
+            let mut position = self.cursor;
+            while position > 0 && !chars[position - 1].is_alphanumeric() {
+                position -= 1;
+            }
+            while position > 0 && chars[position - 1].is_alphanumeric() {
+                position -= 1;
+            }
+            self.cursor = position;
+        } else {
+            let mut position = self.cursor;
+            while position < chars.len() && !chars[position].is_alphanumeric() {
+                position += 1;
+            }
+            while position < chars.len() && chars[position].is_alphanumeric() {
+                position += 1;
+            }
+            self.cursor = position;
+        }
+    }
+
+    fn insert(&mut self, character: char) {
+        let byte = char_byte_index(&self.query, self.cursor);
+        self.query.insert(byte, character);
+        self.cursor += 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let byte = char_byte_index(&self.query, self.cursor - 1);
+        self.query.remove(byte);
+        self.cursor -= 1;
+    }
+
+    fn delete(&mut self) {
+        if self.cursor < self.query.chars().count() {
+            let byte = char_byte_index(&self.query, self.cursor);
+            self.query.remove(byte);
+        }
+    }
+
+    fn clear_to_start(&mut self) {
+        let byte = char_byte_index(&self.query, self.cursor);
+        self.query.drain(..byte);
+        self.cursor = 0;
+    }
+
+    fn clear_to_end(&mut self) {
+        let byte = char_byte_index(&self.query, self.cursor);
+        self.query.truncate(byte);
+    }
+
+    fn delete_word_before(&mut self) {
+        let end = self.cursor;
+        self.move_word(-1);
+        let start = self.cursor;
+        let start_byte = char_byte_index(&self.query, start);
+        let end_byte = char_byte_index(&self.query, end);
+        self.query.drain(start_byte..end_byte);
+    }
+}
+
+fn char_byte_index(text: &str, character: usize) -> usize {
+    text.char_indices()
+        .nth(character)
+        .map(|(byte, _)| byte)
+        .unwrap_or(text.len())
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 enum ModelState {
     #[default]
@@ -343,11 +647,13 @@ impl<'a> App<'a> {
     fn new(cfg: Config, paths: &'a Paths) -> Result<Self> {
         let profiles = Profiles::load(paths)?;
         let benchmarks = benchmark::ProfileBenchmarks::load(paths).unwrap_or_default();
+        let templates = templates::Templates::load(paths)?;
         Ok(Self {
             cfg,
             paths,
             profiles,
             benchmarks,
+            templates,
             page: 0,
             selected: 0,
             filter: String::new(),
@@ -358,11 +664,17 @@ impl<'a> App<'a> {
             benchmark_view: None,
             benchmark_dialog: None,
             runtime_picker: None,
+            template_picker: None,
             background: None,
+            hf: HfBrowser::default(),
+            hf_download: None,
+            template_editor: None,
+            template_name_input: None,
+            template_delete_confirm: None,
             last_tok: BTreeMap::new(),
             profile_estimates: BTreeMap::new(),
             profile_fingerprint: String::new(),
-            notice: "Ready · arrows navigate · Enter acts · ? controls".into(),
+            notice: "Ready - arrows navigate - Enter acts - ? controls".into(),
             models: Vec::new(),
             models_fingerprint: None,
             scan_rx: None,
@@ -386,6 +698,8 @@ impl<'a> App<'a> {
         self.profiles = Profiles::load(self.paths).unwrap_or_else(|_| self.profiles.clone());
         self.benchmarks = benchmark::ProfileBenchmarks::load(self.paths)
             .unwrap_or_else(|_| self.benchmarks.clone());
+        self.templates = templates::Templates::load(self.paths)
+            .unwrap_or_else(|_| self.templates.clone());
 
         // Start estimates before the recurring model scan. Previously the scan
         // was started first and start_estimates() refused to run while it was
@@ -546,7 +860,7 @@ impl<'a> App<'a> {
                     self.last_check =
                         Some((llama.clone(), llama_changed, swap.clone(), swap_changed));
                     self.notice = format!(
-                        "llama.cpp {llama}: {} · llama-swap {swap}: {}",
+                        "llama.cpp {llama}: {} - llama-swap {swap}: {}",
                         if llama_changed {
                             "update available"
                         } else {
@@ -690,9 +1004,19 @@ impl<'a> App<'a> {
     fn count(&self) -> usize {
         match self.page {
             1 => self.visible_models().len(),
-            2 => self.profiles.profiles.len(),
-            3 => settings(&self.cfg).len(),
-            5 => 4,
+            2 => self.templates.templates.len(),
+            3 => self.profiles.profiles.len(),
+            4 => {
+                if self.hf.search_templates {
+                    self.hf.template_hits.len()
+                } else if self.hf.repository.is_some() {
+                    self.hf.artifacts.len()
+                } else {
+                    self.hf.repositories.len()
+                }
+            }
+            5 => settings(&self.cfg).len(),
+            7 => 4,
             _ => 1,
         }
     }
@@ -751,6 +1075,741 @@ impl<'a> App<'a> {
             self.refresh();
         }
     }
+    fn hf_destinations(&self) -> Vec<PathBuf> {
+        // Downloads always land in the llamactl-managed models folder. Other
+        // configured model directories (e.g. LM Studio) are only scanned for
+        // discovery and are never used as download targets.
+        vec![self.paths.data_dir.join("models")]
+    }
+
+    fn start_hf_search(&mut self) {
+        if self.hf.request_rx.is_some() {
+            self.notice = "A Hugging Face request is already running".into();
+            return;
+        }
+        let query = self.hf.query.trim().to_owned();
+        let worker_query = query.clone();
+        let search_templates = self.hf.search_templates;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = if search_templates {
+                huggingface::search_templates(&worker_query).map(HfRequestResult::Templates)
+            } else {
+                huggingface::search(&worker_query).map(HfRequestResult::Repositories)
+            };
+            let _ = tx.send(result);
+        });
+        self.hf.editing = false;
+        self.hf.repository = None;
+        self.hf.artifacts.clear();
+        self.hf.template_hits.clear();
+        self.hf.template_view = None;
+        self.hf.details = None;
+        self.hf.details_open = false;
+        self.hf.detail_scroll = 0;
+        self.hf.request_rx = Some(rx);
+        self.selected = 0;
+        let target = if search_templates { "Jinja templates" } else { "public GGUF repositories" };
+        self.notice = if query.is_empty() {
+            format!("Searching {target}…")
+        } else {
+            format!("Searching Hugging Face for {query}…")
+        };
+    }
+
+    fn open_hf_repository(&mut self) {
+        if self.hf.request_rx.is_some() {
+            return;
+        }
+        let Some(repository) = self.hf.repositories.get(self.selected).cloned() else {
+            self.notice = "Search for a public GGUF repository first".into();
+            return;
+        };
+        let worker_repository = repository.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<HfRequestResult> {
+                let details = huggingface::details(&worker_repository.id)?;
+                let artifacts = huggingface::artifacts(&worker_repository.id)?;
+                Ok(HfRequestResult::Artifacts {
+                    repository: worker_repository,
+                    artifacts,
+                    details,
+                })
+            })();
+            let _ = tx.send(result);
+        });
+        self.hf.request_rx = Some(rx);
+        self.notice = format!("Reading GGUF files from {}…", repository.id);
+    }
+
+    fn poll_hf_request(&mut self) {
+        let result = self
+            .hf
+            .request_rx
+            .as_ref()
+            .map(std::sync::mpsc::Receiver::try_recv);
+        match result {
+            Some(Ok(Ok(HfRequestResult::Repositories(repositories)))) => {
+                self.hf.request_rx = None;
+                let count = repositories.len();
+                self.hf.repositories = repositories;
+                self.hf.repository = None;
+                self.hf.artifacts.clear();
+                self.hf.template_hits.clear();
+                self.hf.template_view = None;
+                self.hf.details = None;
+                self.hf.details_open = false;
+                self.hf.detail_scroll = 0;
+                self.selected = 0;
+                self.notice = if count == 0 {
+                    "No public, non-gated GGUF repositories matched".into()
+                } else {
+                    format!("Found {count} public GGUF repositories")
+                };
+            }
+            Some(Ok(Ok(HfRequestResult::Templates(hits)))) => {
+                self.hf.request_rx = None;
+                let count = hits.len();
+                self.hf.template_hits = hits;
+                self.hf.repository = None;
+                self.hf.artifacts.clear();
+                self.hf.repositories.clear();
+                self.hf.template_view = None;
+                self.hf.details = None;
+                self.hf.details_open = false;
+                self.hf.detail_scroll = 0;
+                self.selected = 0;
+                self.notice = if count == 0 {
+                    "No public repositories with a chat template matched".into()
+                } else {
+                    format!("Found {count} repositories with a Jinja template")
+                };
+            }
+            Some(Ok(Ok(HfRequestResult::Artifacts {
+                repository,
+                artifacts,
+                details,
+            }))) => {
+                self.hf.request_rx = None;
+                let count = artifacts.len();
+                let name = repository.id.clone();
+                self.hf.repository = Some(repository);
+                self.hf.artifacts = artifacts;
+                self.hf.details = Some(details);
+                self.hf.details_open = true;
+                self.hf.detail_scroll = 0;
+                self.selected = 0;
+                self.notice = if count == 0 {
+                    format!("No downloadable GGUF model files in {name}")
+                } else {
+                    format!("{count} quantizations available in {name}")
+                };
+            }
+            Some(Ok(Ok(HfRequestResult::Details(details)))) => {
+                self.hf.request_rx = None;
+                self.hf.details = Some(details);
+                self.hf.details_open = true;
+                self.hf.detail_scroll = 0;
+                self.notice = "Loaded Hugging Face model card".into();
+            }
+            Some(Ok(Err(error))) => {
+                self.hf.request_rx = None;
+                self.notice = format!("✗ {error:#}");
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                self.hf.request_rx = None;
+                self.notice = "✗ Hugging Face request worker stopped unexpectedly".into();
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Empty)) | None => {}
+        }
+    }
+
+    fn hf_action(&mut self) {
+        if self.hf.request_rx.is_some() {
+            self.notice = "Wait for the Hugging Face request to finish".into();
+            return;
+        }
+        if self.hf.search_templates {
+            if let Some(hit) = self.hf.template_hits.get(self.selected).cloned() {
+                self.hf.template_view = Some(TemplateView {
+                    id: hit.id.clone(),
+                    template: hit.template,
+                    scroll: 0,
+                });
+            } else {
+                self.open_hf_search_modal();
+            }
+            return;
+        }
+        if let Some(repository) = self.hf.repository.clone() {
+            let Some(artifact) = self.hf.artifacts.get(self.selected).cloned() else {
+                self.notice = "No GGUF quantization selected".into();
+                return;
+            };
+            if !artifact.complete {
+                self.notice = "✗ This split GGUF is missing one or more shards".into();
+                return;
+            }
+            let destinations = self.hf_destinations();
+            self.hf.destination %= destinations.len();
+            let root = destinations[self.hf.destination].clone();
+            let Some((owner, name)) = repository.id.split_once('/') else {
+                self.notice = "✗ Invalid Hugging Face repository identifier".into();
+                return;
+            };
+            let destination = root.join(owner).join(name);
+            self.hf.confirm = Some(HfDownloadSelection {
+                repository,
+                artifact,
+                destination,
+            });
+        } else if self.hf.repositories.is_empty() {
+            self.open_hf_search_modal();
+        } else {
+            self.open_hf_repository();
+        }
+    }
+
+    fn open_hf_search_modal(&mut self) {
+        if self.hf.request_rx.is_some() {
+            self.notice = "Wait for the Hugging Face request to finish".into();
+            return;
+        }
+        self.hf.editing = true;
+        self.hf.cursor = self.hf.query.chars().count();
+    }
+
+    fn begin_hf_download(&mut self) {
+        if self.background.is_some() {
+            self.notice = "Wait for the current background task to finish".into();
+            self.hf.confirm = None;
+            return;
+        }
+        let Some(selection) = self.hf.confirm.take() else {
+            return;
+        };
+        let files = selection
+            .artifact
+            .files
+            .iter()
+            .map(|file| (file.path.clone(), file.size))
+            .collect::<BTreeMap<_, _>>();
+        let handle = huggingface::spawn_download(
+            selection.repository.id.clone(),
+            selection.artifact.files,
+            selection.destination.clone(),
+        );
+        self.notice = format!(
+            "Downloading {} from {}…",
+            selection.artifact.label, selection.repository.id
+        );
+        self.hf_download = Some(HfDownloadDialog {
+            repository: selection.repository.id,
+            destination: selection.destination,
+            progress: files.keys().map(|path| (path.clone(), 0)).collect(),
+            baseline: BTreeMap::new(),
+            files,
+            events: handle.events,
+            cancel: handle.cancel,
+            current: String::new(),
+            phase: "Preparing download…".into(),
+            retry: None,
+            started_at: Instant::now(),
+            completed_files: 0,
+            cancelling: false,
+        });
+    }
+
+    fn poll_hf_download(&mut self) {
+        let mut finished = None;
+        if let Some(download) = self.hf_download.as_mut() {
+            loop {
+                match download.events.try_recv() {
+                    Ok(huggingface::DownloadEvent::FileStarted { path, total }) => {
+                        download.current = path.clone();
+                        download.files.insert(path, total);
+                        download.phase = "Downloading model files…".into();
+                        download.retry = None;
+                    }
+                    Ok(huggingface::DownloadEvent::FileProgress {
+                        path,
+                        downloaded,
+                        total,
+                    }) => {
+                        download.current = path.clone();
+                        download.files.insert(path.clone(), total);
+                        download
+                            .baseline
+                            .entry(path.clone())
+                            .or_insert(downloaded.min(total));
+                        download.progress.insert(path, downloaded.min(total));
+                    }
+                    Ok(huggingface::DownloadEvent::Verifying { path }) => {
+                        download.current = path;
+                        download.phase = "Verifying SHA-256…".into();
+                        download.retry = None;
+                    }
+                    Ok(huggingface::DownloadEvent::Retrying {
+                        path,
+                        attempt,
+                        message,
+                    }) => {
+                        download.current = path;
+                        download.phase = format!("Retrying transfer - attempt {attempt}");
+                        download.retry = Some(message);
+                    }
+                    Ok(huggingface::DownloadEvent::FileDone { path, skipped }) => {
+                        if let Some(total) = download.files.get(&path).copied() {
+                            if skipped {
+                                download.baseline.insert(path.clone(), total);
+                            }
+                            download.progress.insert(path, total);
+                        }
+                        download.completed_files += 1;
+                        download.phase = if skipped {
+                            "Existing verified file reused".into()
+                        } else {
+                            "File verified".into()
+                        };
+                        download.retry = None;
+                    }
+                    Ok(huggingface::DownloadEvent::Finished(result)) => {
+                        finished = Some(result);
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        finished = Some(Err("download worker stopped unexpectedly".into()));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(result) = finished {
+            let cancelled = self
+                .hf_download
+                .as_ref()
+                .is_some_and(|download| download.cancelling);
+            self.hf_download = None;
+            match result {
+                Ok(summary) => {
+                    self.notice = format!(
+                        "Downloaded {} file(s), reused {} - {}",
+                        summary.downloaded,
+                        summary.skipped,
+                        summary.destination.display()
+                    );
+                    self.models_fingerprint = None;
+                    self.start_scan();
+                }
+                Err(_) if cancelled => {
+                    self.notice = "Model download cancelled - partial files kept".into()
+                }
+                Err(error) => self.notice = format!("✗ Model download failed: {error}"),
+            }
+        }
+    }
+
+    fn cancel_hf_download(&mut self) {
+        if let Some(download) = self.hf_download.as_mut() {
+            download
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            download.cancelling = true;
+            download.phase = "Cancelling - partial files will be kept…".into();
+            self.notice = "Cancelling model download…".into();
+        }
+    }
+
+    fn handle_hf_confirm(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') => self.begin_hf_download(),
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') => {
+                self.hf.confirm = None;
+                self.notice = "Model download cancelled".into();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_hf_search_input(&mut self, key: KeyEvent) {
+        match self.hf.handle_input(key) {
+            HfInputAction::Submit => self.start_hf_search(),
+            HfInputAction::Cancel => {
+                self.hf.editing = false;
+                self.notice = "Search editing cancelled".into();
+            }
+            HfInputAction::None => {}
+        }
+    }
+
+    fn show_hf_details(&mut self) {
+        let repository = self
+            .hf
+            .repository
+            .as_ref()
+            .or_else(|| self.hf.repositories.get(self.selected));
+        let Some(repository) = repository else {
+            self.notice = "Select a Hugging Face repository first".into();
+            return;
+        };
+        if self
+            .hf
+            .details
+            .as_ref()
+            .is_some_and(|details| details.id == repository.id)
+        {
+            self.hf.details_open = true;
+            self.hf.detail_scroll = 0;
+            return;
+        }
+        if self.hf.request_rx.is_some() {
+            self.notice = "A Hugging Face request is already running".into();
+            return;
+        }
+        let repo = repository.id.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(huggingface::details(&repo).map(HfRequestResult::Details));
+        });
+        self.hf.request_rx = Some(rx);
+        self.notice = format!("Loading model card for {}…", repository.id);
+    }
+
+    fn handle_hf_details(&mut self, key: KeyEvent) {
+        let lines = self
+            .hf
+            .details
+            .as_ref()
+            .map(|details| {
+                details
+                    .readme
+                    .lines()
+                    .map(|line| line.chars().count().max(1).div_ceil(80))
+                    .sum::<usize>()
+            })
+            .unwrap_or(0)
+            .min(u16::MAX as usize) as u16;
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('i') => {
+                self.hf.details_open = false;
+                self.notice = if self.hf.repository.is_some() {
+                    "Choose a GGUF quantization to download".into()
+                } else {
+                    "Back to Hugging Face search results".into()
+                };
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.hf.detail_scroll = self.hf.detail_scroll.saturating_sub(1)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.hf.detail_scroll = self
+                    .hf
+                    .detail_scroll
+                    .saturating_add(1)
+                    .min(lines.saturating_sub(1))
+            }
+            KeyCode::PageUp => self.hf.detail_scroll = self.hf.detail_scroll.saturating_sub(10),
+            KeyCode::PageDown | KeyCode::Char(' ') => {
+                self.hf.detail_scroll = self
+                    .hf
+                    .detail_scroll
+                    .saturating_add(10)
+                    .min(lines.saturating_sub(1))
+            }
+            KeyCode::Home => self.hf.detail_scroll = 0,
+            KeyCode::End => self.hf.detail_scroll = lines.saturating_sub(1),
+            _ => {}
+        }
+    }
+
+    fn hf_back(&mut self) {
+        if self.hf.repository.take().is_some() {
+            self.hf.artifacts.clear();
+            self.selected = 0;
+            self.notice = "Back to Hugging Face search results".into();
+        }
+    }
+
+    fn refresh_hf_page(&mut self) {
+        if self.hf.request_rx.is_some() {
+            self.notice = "A Hugging Face request is already running".into();
+            return;
+        }
+        if let Some(repository) = self.hf.repository.clone() {
+            let worker_repository = repository.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result = (|| -> Result<HfRequestResult> {
+                    let details = huggingface::details(&worker_repository.id)?;
+                    let artifacts = huggingface::artifacts(&worker_repository.id)?;
+                    Ok(HfRequestResult::Artifacts {
+                        repository: worker_repository,
+                        artifacts,
+                        details,
+                    })
+                })();
+                let _ = tx.send(result);
+            });
+            self.hf.request_rx = Some(rx);
+            self.notice = format!("Reloading GGUF files from {}…", repository.id);
+        } else {
+            self.start_hf_search();
+        }
+    }
+
+    fn toggle_hf_search_mode(&mut self) {
+        self.hf.search_templates = !self.hf.search_templates;
+        self.hf.repositories.clear();
+        self.hf.repository = None;
+        self.hf.artifacts.clear();
+        self.hf.template_hits.clear();
+        self.hf.template_view = None;
+        self.hf.details = None;
+        self.hf.details_open = false;
+        self.selected = 0;
+        self.notice = if self.hf.search_templates {
+            "Search mode: Jinja chat templates".into()
+        } else {
+            "Search mode: GGUF models".into()
+        };
+    }
+
+    fn handle_hf_template_view(&mut self, key: KeyEvent) {
+        let Some(view) = self.hf.template_view.clone() else {
+            return;
+        };
+        let total_lines = view.template.lines().count().max(1) as u16;
+        let mut new_scroll = None;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('i') => {
+                self.hf.template_view = None;
+                self.notice = "Back to Jinja template search results".into();
+                return;
+            }
+            KeyCode::Char('s') => {
+                if self.save_viewed_template(&view.id, &view.template) {
+                    self.hf.template_view = None;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => new_scroll = Some(view.scroll.saturating_sub(1)),
+            KeyCode::Down | KeyCode::Char('j') => {
+                new_scroll = Some((view.scroll + 1).min(total_lines.saturating_sub(1)))
+            }
+            KeyCode::PageUp => new_scroll = Some(view.scroll.saturating_sub(10)),
+            KeyCode::PageDown | KeyCode::Char(' ') => {
+                new_scroll = Some((view.scroll + 10).min(total_lines.saturating_sub(1)))
+            }
+            KeyCode::Home => new_scroll = Some(0),
+            KeyCode::End => new_scroll = Some(total_lines.saturating_sub(1)),
+            _ => {}
+        }
+        if let (Some(scroll), Some(view)) = (new_scroll, self.hf.template_view.as_mut()) {
+            view.scroll = scroll;
+        }
+    }
+
+    fn save_viewed_template(&mut self, id: &str, template: &str) -> bool {
+        let name = id.rsplit('/').next().unwrap_or(id).to_owned();
+        if let Err(error) = templates::valid_name(&name) {
+            self.notice = format!("✗ {error:#}");
+            return false;
+        }
+        if self.templates.templates.contains_key(&name) {
+            self.notice = format!("Template {name} already exists - edit it on the Templates page");
+            return false;
+        }
+        self.templates.templates.insert(name.clone(), template.to_owned());
+        match self.templates.save(self.paths) {
+            Ok(()) => {
+                self.notice = format!("Saved template {name}");
+                true
+            }
+            Err(error) => {
+                self.notice = format!("✗ {error:#}");
+                false
+            }
+        }
+    }
+
+    fn open_template_editor(&mut self, name: String) {
+        let text = self.templates.templates.get(&name).cloned().unwrap_or_default();
+        self.template_editor = Some(TemplateEditor::new(name, text, false));
+    }
+
+    fn add_template(&mut self, name: &str) {
+        if let Err(error) = templates::valid_name(name) {
+            self.notice = format!("✗ {error:#}");
+            return;
+        }
+        if self.templates.templates.contains_key(name) {
+            self.notice = format!("✗ Template {name} already exists");
+            return;
+        }
+        self.template_editor = Some(TemplateEditor::new(name.to_owned(), String::new(), true));
+    }
+
+    fn rename_template(&mut self, old: &str, new: &str) {
+        if old == new {
+            return;
+        }
+        if let Err(error) = templates::valid_name(new) {
+            self.notice = format!("✗ {error:#}");
+            return;
+        }
+        if self.templates.templates.contains_key(new) {
+            self.notice = format!("✗ Template {new} already exists");
+            return;
+        }
+        if let Some(value) = self.templates.templates.remove(old) {
+            self.templates.templates.insert(new.to_owned(), value);
+            match self.templates.save(self.paths) {
+                Ok(()) => self.notice = format!("Renamed template {old} to {new}"),
+                Err(error) => self.notice = format!("✗ {error:#}"),
+            }
+        }
+    }
+
+    fn save_template_editor(&mut self, name: &str, text: &str) {
+        if name.trim().is_empty() {
+            self.notice = "✗ Template name cannot be empty".into();
+            return;
+        }
+        if let Err(error) = templates::valid_name(name) {
+            self.notice = format!("✗ {error:#}");
+            return;
+        }
+        self.templates.templates.insert(name.to_owned(), text.to_owned());
+        match self.templates.save(self.paths) {
+            Ok(()) => self.notice = format!("Saved template {name}"),
+            Err(error) => self.notice = format!("✗ {error:#}"),
+        }
+    }
+
+    fn handle_template_editor(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && key.code == KeyCode::Char('s') {
+            if let Some(editor) = self.template_editor.take() {
+                let name = editor.name.clone();
+                let text = editor.text();
+                self.save_template_editor(&name, &text);
+            }
+            return;
+        }
+        if key.code == KeyCode::Esc {
+            self.template_editor = None;
+            self.notice = "Template editing cancelled".into();
+            return;
+        }
+        let Some(editor) = self.template_editor.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Up => editor.move_up(),
+            KeyCode::Down => editor.move_down(),
+            KeyCode::Left => editor.move_left(),
+            KeyCode::Right => editor.move_right(),
+            KeyCode::Home => editor.move_home(),
+            KeyCode::End => editor.move_end(),
+            KeyCode::Enter => editor.insert_char('\n'),
+            KeyCode::Backspace => editor.backspace(),
+            KeyCode::Delete => editor.delete(),
+            KeyCode::Char(c) if !c.is_control() => editor.insert_char(c),
+            _ => {}
+        }
+    }
+
+    fn handle_template_name_input(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Esc {
+            self.template_name_input = None;
+            self.notice = "Template name entry cancelled".into();
+            return;
+        }
+        if key.code == KeyCode::Enter {
+            let Some(input) = self.template_name_input.take() else {
+                return;
+            };
+            let name = input.text.trim().to_owned();
+            if let Some(old) = input.rename {
+                self.rename_template(&old, &name);
+            } else {
+                self.add_template(&name);
+            }
+            return;
+        }
+        let Some(input) = self.template_name_input.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Left => input.cursor = input.cursor.saturating_sub(1),
+            KeyCode::Right => input.cursor = (input.cursor + 1).min(input.text.chars().count()),
+            KeyCode::Home => input.cursor = 0,
+            KeyCode::End => input.cursor = input.text.chars().count(),
+            KeyCode::Backspace => {
+                if input.cursor > 0 {
+                    let byte = char_byte_index(&input.text, input.cursor - 1);
+                    input.text.remove(byte);
+                    input.cursor -= 1;
+                }
+            }
+            KeyCode::Delete => {
+                if input.cursor < input.text.chars().count() {
+                    let byte = char_byte_index(&input.text, input.cursor);
+                    input.text.remove(byte);
+                }
+            }
+            KeyCode::Char(c) if !c.is_control() => {
+                let byte = char_byte_index(&input.text, input.cursor);
+                input.text.insert(byte, c);
+                input.cursor += 1;
+            }
+            _ => {}
+        }
+    }
+
+    fn request_template_delete(&mut self) {
+        let Some(name) = self.selected_template_name() else {
+            self.notice = "No template selected".into();
+            return;
+        };
+        self.template_delete_confirm = Some(name);
+    }
+
+    fn handle_template_delete_confirm(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') => {
+                let Some(name) = self.template_delete_confirm.take() else {
+                    return;
+                };
+                self.templates.templates.remove(&name);
+                match self.templates.save(self.paths) {
+                    Ok(()) => self.notice = format!("Deleted template {name}"),
+                    Err(error) => self.notice = format!("✗ {error:#}"),
+                }
+                self.selected = self.selected.min(self.count().saturating_sub(1));
+            }
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') => {
+                self.template_delete_confirm = None;
+                self.notice = "Template deletion cancelled".into();
+            }
+            _ => {}
+        }
+    }
+
+    fn selected_template_name(&self) -> Option<String> {
+        self.templates.templates.keys().nth(self.selected).cloned()
+    }
+
+    fn request_template_name(&mut self, rename: Option<String>) {
+        let text = rename.clone().unwrap_or_default();
+        self.template_name_input = Some(TemplateNameInput {
+            text,
+            cursor: rename.as_ref().map(|n| n.chars().count()).unwrap_or(0),
+            rename,
+        });
+    }
+
     fn regenerate_swap_async(&mut self, message: String) {
         let cfg = self.cfg.clone();
         let paths = self.paths.clone();
@@ -787,9 +1846,9 @@ impl<'a> App<'a> {
             self.refresh();
             return;
         }
-        let message = if self.page == 3 && self.selected == 3 {
+        let message = if self.page == 5 && self.selected == 3 {
             format!(
-                "Selected runtime {} · restart the server to apply",
+                "Selected runtime {} - restart the server to apply",
                 self.cfg.runtime
             )
         } else {
@@ -901,6 +1960,82 @@ impl<'a> App<'a> {
                 if let Some(runtime) = runtime {
                     self.cfg.runtime = runtime;
                     self.save_runtime_state();
+                }
+            }
+            _ => {}
+        }
+    }
+    fn editor_on_chat_template(&self) -> bool {
+        self.profile_editor.as_ref().is_some_and(|editor| {
+            editor.fields.get(editor.selected).copied() == Some(EditorField::ChatTemplate)
+        })
+    }
+    fn open_template_picker(&mut self) {
+        let options = self.templates.templates.keys().cloned().collect::<Vec<_>>();
+        if options.is_empty() {
+            self.notice = "No saved templates - add them on the Search or Templates page".into();
+            return;
+        }
+        let current = self
+            .profile_editor
+            .as_ref()
+            .map(|editor| editor.settings.chat_template.clone())
+            .unwrap_or_default();
+        let selected = options
+            .iter()
+            .position(|name| {
+                self.templates
+                    .templates
+                    .get(name)
+                    .is_some_and(|template| *template == current)
+            })
+            .unwrap_or(0);
+        self.template_picker = Some(TemplatePicker { options, selected });
+    }
+    fn handle_template_picker(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.template_picker = None,
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(picker) = &mut self.template_picker {
+                    picker.selected = picker.selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(picker) = &mut self.template_picker {
+                    picker.selected =
+                        (picker.selected + 1).min(picker.options.len().saturating_sub(1));
+                }
+            }
+            KeyCode::Home => {
+                if let Some(picker) = &mut self.template_picker {
+                    picker.selected = 0;
+                }
+            }
+            KeyCode::End => {
+                if let Some(picker) = &mut self.template_picker {
+                    picker.selected = picker.options.len().saturating_sub(1);
+                }
+            }
+            KeyCode::Enter => {
+                let name = self
+                    .template_picker
+                    .as_ref()
+                    .and_then(|picker| picker.options.get(picker.selected))
+                    .cloned();
+                self.template_picker = None;
+                if let Some(name) = name {
+                    let template = self
+                        .templates
+                        .templates
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or_default();
+                    if let Some(editor) = self.profile_editor.as_mut() {
+                        editor.settings.chat_template = template;
+                        editor.settings.jinja = true;
+                        editor.notice = format!("Applied template {name}");
+                    }
+                    self.spawn_editor_estimate();
                 }
             }
             _ => {}
@@ -1347,7 +2482,6 @@ impl<'a> App<'a> {
             EditorField::Reasoning => s.reasoning = raw.to_owned(),
             EditorField::Jinja => s.jinja = on(),
             EditorField::ChatTemplate => s.chat_template = raw.to_owned(),
-            EditorField::ChatTemplateFile => s.chat_template_file = raw.to_owned(),
             EditorField::ChatTemplateKwargs => s.chat_template_kwargs = raw.to_owned(),
             EditorField::Extra => s.extra = raw.split_whitespace().map(str::to_owned).collect(),
             EditorField::Assign | EditorField::Advanced => {}
@@ -1388,6 +2522,10 @@ impl<'a> App<'a> {
             }
             EditorField::Assign => {
                 settings.assign = !settings.assign;
+                true
+            }
+            EditorField::SpecDraftNMax => {
+                settings.spec_draft_nmax = step_nonnegative(settings.spec_draft_nmax, dir);
                 true
             }
             EditorField::Advanced => {
@@ -1486,10 +2624,6 @@ impl<'a> App<'a> {
             EditorField::ChatTemplate => (
                 "Inline Jinja chat template",
                 editor.settings.chat_template.clone(),
-            ),
-            EditorField::ChatTemplateFile => (
-                "Jinja chat template file",
-                editor.settings.chat_template_file.clone(),
             ),
             EditorField::ChatTemplateKwargs => (
                 "Chat template kwargs (JSON object)",
@@ -1626,7 +2760,6 @@ impl<'a> App<'a> {
                 EditorField::Seed => editor.settings.seed = text,
                 EditorField::Reasoning => editor.settings.reasoning = text,
                 EditorField::ChatTemplate => editor.settings.chat_template = text,
-                EditorField::ChatTemplateFile => editor.settings.chat_template_file = text,
                 EditorField::ChatTemplateKwargs => {
                     if text.is_empty()
                         || serde_json::from_str::<serde_json::Map<String, Value>>(&text).is_ok()
@@ -1882,8 +3015,20 @@ impl<'a> App<'a> {
                         (editor.selected + 1).min(editor.fields.len().saturating_sub(1));
                 }
             }
-            KeyCode::Left | KeyCode::Char('h') => self.editor_cycle(-1),
-            KeyCode::Right | KeyCode::Char('l') => self.editor_cycle(1),
+            KeyCode::Left | KeyCode::Char('h') => {
+                if self.editor_on_chat_template() {
+                    self.open_template_picker();
+                } else {
+                    self.editor_cycle(-1);
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                if self.editor_on_chat_template() {
+                    self.open_template_picker();
+                } else {
+                    self.editor_cycle(1);
+                }
+            }
             KeyCode::Char('t') => self.editor_open_typed(),
             KeyCode::Char('e') => {
                 let is_extra = self.profile_editor.as_ref().is_some_and(|editor| {
@@ -2194,6 +3339,7 @@ impl<'a> App<'a> {
         let worker_profile = profile.clone();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let benchmark_started_at = Instant::now();
         std::thread::spawn(move || {
             let result = benchmark::run_cancellable_with_progress(
                 &cfg,
@@ -2203,7 +3349,7 @@ impl<'a> App<'a> {
                 worker_cancelled,
                 progress_tx,
             )
-            .map(|run| benchmark::summary(&run).replace('\n', " · "));
+            .map(|run| benchmark::summary(&run).replace('\n', " - "));
             let _ = result_tx.send(result);
         });
         self.benchmark_dialog = Some(BenchmarkDialog::Running {
@@ -2215,11 +3361,14 @@ impl<'a> App<'a> {
             runtime: String::new(),
             effective_context: None,
             load_ms: None,
+            benchmark_started_at,
+            case_started_at: None,
+            case_elapsed: Duration::ZERO,
             completed: Vec::new(),
         });
     }
     fn handle_benchmark_dialog(&mut self, key: KeyEvent) {
-        match &self.benchmark_dialog {
+        match &mut self.benchmark_dialog {
             Some(BenchmarkDialog::Confirm { profile }) => match key.code {
                 KeyCode::Enter | KeyCode::Char('y') => {
                     let profile = profile.clone();
@@ -2231,12 +3380,15 @@ impl<'a> App<'a> {
                 }
                 _ => {}
             },
-            Some(BenchmarkDialog::Running { cancelled, .. }) => {
+            Some(BenchmarkDialog::Running {
+                cancelled, phase, ..
+            }) => {
                 if matches!(
                     key.code,
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('c')
                 ) {
                     cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                    *phase = "Cancelling benchmark…".into();
                     self.notice = "Cancelling benchmark and restoring server…".into();
                 }
             }
@@ -2250,6 +3402,8 @@ impl<'a> App<'a> {
             runtime,
             effective_context,
             load_ms,
+            case_started_at,
+            case_elapsed,
             completed,
             ..
         }) = &mut self.benchmark_dialog
@@ -2276,15 +3430,24 @@ impl<'a> App<'a> {
                     benchmark::BenchmarkProgress::CaseStarted {
                         name,
                         target_prompt_tokens,
+                        started_at,
                     } => {
+                        *case_started_at = Some(started_at);
+                        *case_elapsed = Duration::ZERO;
                         *phase =
-                            format!("Running {name} case · {target_prompt_tokens} prompt tokens…")
+                            format!("Running {name} case - {target_prompt_tokens} prompt tokens…")
                     }
                     benchmark::BenchmarkProgress::CaseCompleted(case) => {
+                        if let Some(started_at) = case_started_at.take() {
+                            *case_elapsed = started_at.elapsed();
+                        }
                         *phase = format!("Completed {} case", case.name);
                         completed.push(case);
                     }
                     benchmark::BenchmarkProgress::RestoringServer => {
+                        if let Some(started_at) = case_started_at.take() {
+                            *case_elapsed = started_at.elapsed();
+                        }
                         *phase = "Restoring previous server…".into()
                     }
                 }
@@ -2333,7 +3496,7 @@ impl<'a> App<'a> {
                     let profiles = self.profiles.clone();
                     self.spawn_task("starting server", move || {
                         let pid = process::start(&cfg, &paths, &profiles, None, &[])?;
-                        Ok(format!("Server started · pid {pid}"))
+                        Ok(format!("Server started - pid {pid}"))
                     });
                 }
             }
@@ -2359,16 +3522,16 @@ impl<'a> App<'a> {
                                 process::stop(&paths)?;
                             }
                             let pid = process::start(&cfg, &paths, &profiles, Some(&id), &[])?;
-                            Ok(format!("Started {id} · pid {pid}"))
+                            Ok(format!("Started {id} - pid {pid}"))
                         });
                     }
                 }
             }
-            2 => {
+            3 => {
                 self.start_exact_profile();
                 return;
             }
-            5 => match self.selected {
+            7 => match self.selected {
                 0 => {
                     self.notice = "… checking updates".into();
                     self.start_update_check();
@@ -2413,7 +3576,15 @@ impl<'a> App<'a> {
                 }
                 _ => self.notice = "Use the arrows and Enter".into(),
             },
-            3 => self.toggle_setting(1),
+            5 => self.toggle_setting(1),
+            4 => self.hf_action(),
+            2 => {
+                if let Some(name) = self.selected_template_name() {
+                    self.open_template_editor(name);
+                } else {
+                    self.request_template_name(None);
+                }
+            }
             _ => self.notice = "Use the page-specific shortcut shown in its title".into(),
         }
         self.refresh();
@@ -2468,6 +3639,8 @@ pub fn run(cfg: Config, paths: &Paths) -> Result<()> {
         app.poll_estimates();
         loop {
             app.poll_profile_benchmark();
+            app.poll_hf_request();
+            app.poll_hf_download();
             let benchmark_running =
                 matches!(&app.benchmark_dialog, Some(BenchmarkDialog::Running { .. }));
             app.poll_telemetry();
@@ -2478,7 +3651,11 @@ pub fn run(cfg: Config, paths: &Paths) -> Result<()> {
                 app.poll_estimates();
                 app.poll_update_check();
             }
-            if app.background.is_some() || benchmark_running {
+            if app.background.is_some()
+                || benchmark_running
+                || app.hf.request_rx.is_some()
+                || app.hf_download.is_some()
+            {
                 app.throbber_state.calc_next();
             }
             terminal.draw(|f| draw(f, &mut app))?;
@@ -2490,6 +3667,8 @@ pub fn run(cfg: Config, paths: &Paths) -> Result<()> {
                     if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
                         if app.benchmark_dialog.is_some() {
                             app.handle_benchmark_dialog(k);
+                        } else if app.hf_download.is_some() {
+                            app.cancel_hf_download();
                         } else {
                             break;
                         }
@@ -2497,6 +3676,22 @@ pub fn run(cfg: Config, paths: &Paths) -> Result<()> {
                     }
                     match k.code {
                         _ if app.benchmark_dialog.is_some() => app.handle_benchmark_dialog(k),
+                        _ if app.hf_download.is_some() => {
+                            if matches!(
+                                k.code,
+                                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('c')
+                            ) {
+                                app.cancel_hf_download();
+                            }
+                        }
+                        _ if app.hf.confirm.is_some() => app.handle_hf_confirm(k),
+                        _ if app.hf.template_view.is_some() => app.handle_hf_template_view(k),
+                        _ if app.template_editor.is_some() => app.handle_template_editor(k),
+                        _ if app.template_name_input.is_some() => app.handle_template_name_input(k),
+                        _ if app.template_delete_confirm.is_some() => {
+                            app.handle_template_delete_confirm(k)
+                        }
+                        _ if app.hf.details_open => app.handle_hf_details(k),
                         _ if app.key_help => {
                             if matches!(
                                 k.code,
@@ -2513,8 +3708,10 @@ pub fn run(cfg: Config, paths: &Paths) -> Result<()> {
                         }
                         _ if app.benchmark_view.is_some() => app.handle_benchmark_view(k),
                         _ if app.runtime_picker.is_some() => app.handle_runtime_picker(k),
+                        _ if app.template_picker.is_some() => app.handle_template_picker(k),
                         _ if app.profile_editor.is_some() => app.handle_profile_editor(k),
                         _ if app.rename_input.is_some() => app.handle_rename_input(k),
+                        _ if app.page == 4 && app.hf.editing => app.handle_hf_search_input(k),
                         KeyCode::Char('q') => break,
                         KeyCode::Char('?') => app.key_help = true,
                         KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
@@ -2525,7 +3722,7 @@ pub fn run(cfg: Config, paths: &Paths) -> Result<()> {
                             app.page = (app.page + PAGES.len() - 1) % PAGES.len();
                             app.selected = 0
                         }
-                        KeyCode::Char(c) if ('1'..='6').contains(&c) => {
+                        KeyCode::Char(c) if ('1'..='8').contains(&c) => {
                             app.page = c as usize - '1' as usize;
                             app.selected = 0
                         }
@@ -2538,8 +3735,29 @@ pub fn run(cfg: Config, paths: &Paths) -> Result<()> {
                         KeyCode::Home => app.selected = 0,
                         KeyCode::End => app.selected = app.count().saturating_sub(1),
                         KeyCode::Enter => app.action(),
-                        KeyCode::Char('R') if app.page == 2 => app.start_profile_rename(),
-                        KeyCode::Char('e') if app.page == 2 => app.open_profile_editor(),
+                        KeyCode::Char('R') if app.page == 3 => app.start_profile_rename(),
+                        KeyCode::Char('e') if app.page == 3 => app.open_profile_editor(),
+                        KeyCode::Char('/') | KeyCode::Char('s') if app.page == 4 => {
+                            app.open_hf_search_modal();
+                        }
+                        KeyCode::Esc | KeyCode::Char('b')
+                            if app.page == 4 && app.hf.repository.is_some() =>
+                        {
+                            app.hf_back()
+                        }
+                        KeyCode::Char('i') if app.page == 4 => app.show_hf_details(),
+                        KeyCode::Char('r') if app.page == 4 => app.refresh_hf_page(),
+                        KeyCode::Char('t') if app.page == 4 => app.toggle_hf_search_mode(),
+                        KeyCode::Char('e') if app.page == 2 => {
+                            if let Some(name) = app.selected_template_name() {
+                                app.open_template_editor(name);
+                            }
+                        }
+                        KeyCode::Char('a') if app.page == 2 => app.request_template_name(None),
+                        KeyCode::Char('R') if app.page == 2 => {
+                            app.request_template_name(app.selected_template_name())
+                        }
+                        KeyCode::Char('d') if app.page == 2 => app.request_template_delete(),
                         KeyCode::Char('r') => {
                             app.refresh();
                             app.notice = "Refreshed".into()
@@ -2561,17 +3779,17 @@ pub fn run(cfg: Config, paths: &Paths) -> Result<()> {
                                 });
                             }
                         }
-                        KeyCode::Char('m') if app.page == 2 => app.request_profile_benchmark(),
-                        KeyCode::Char('v') if app.page == 2 => app.show_profile_benchmarks(),
-                        KeyCode::Char('c') if app.page == 2 => app.profile_clone_selected(),
-                        KeyCode::Char('d') if app.page == 2 => app.request_profile_delete(),
-                        KeyCode::Char('p') if app.page == 2 => app.toggle_profile_pin(),
-                        KeyCode::Char('b') if app.page == 2 => app.bind_selected_profile(),
-                        KeyCode::Char(c) if app.page == 2 && "+-[]tfk".contains(c) => {
+                        KeyCode::Char('m') if app.page == 3 => app.request_profile_benchmark(),
+                        KeyCode::Char('v') if app.page == 3 => app.show_profile_benchmarks(),
+                        KeyCode::Char('c') if app.page == 3 => app.profile_clone_selected(),
+                        KeyCode::Char('d') if app.page == 3 => app.request_profile_delete(),
+                        KeyCode::Char('p') if app.page == 3 => app.toggle_profile_pin(),
+                        KeyCode::Char('b') if app.page == 3 => app.bind_selected_profile(),
+                        KeyCode::Char(c) if app.page == 3 && "+-[]tfk".contains(c) => {
                             app.adjust_profile(c)
                         }
-                        KeyCode::Char('=') if app.page == 2 => app.adjust_profile('+'),
-                        KeyCode::Char('u') if app.page == 2 => {
+                        KeyCode::Char('=') if app.page == 3 => app.adjust_profile('+'),
+                        KeyCode::Char('u') if app.page == 3 => {
                             if let Some(profile) = app.selected_profile() {
                                 let cfg = app.cfg.clone();
                                 let profiles = app.profiles.clone();
@@ -2581,10 +3799,10 @@ pub fn run(cfg: Config, paths: &Paths) -> Result<()> {
                                 });
                             }
                         }
-                        KeyCode::Char('+') | KeyCode::Char('=') if app.page == 3 => {
+                        KeyCode::Char('+') | KeyCode::Char('=') if app.page == 5 => {
                             app.toggle_setting(1)
                         }
-                        KeyCode::Char('-') if app.page == 3 => app.toggle_setting(-1),
+                        KeyCode::Char('-') if app.page == 5 => app.toggle_setting(-1),
                         _ => {}
                     }
                 }
@@ -2610,7 +3828,7 @@ fn draw_loading(frame: &mut ratatui::Frame, app: &App) {
     let ch = spinner
         .chars()
         .nth((elapsed * 4.0) as usize % spinner.chars().count())
-        .unwrap_or('·');
+        .unwrap_or('-');
     let body = format!("\n {ch} Loading model library…\n\n elapsed {elapsed:.0}s");
     let center = if area.width > 32 && area.height > 9 {
         let vertical = Layout::default()
@@ -2650,8 +3868,54 @@ fn page_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             BenchmarkDialog::Running { .. } => vec![("Esc/q/c", "cancel benchmark")],
         };
     }
+    if app.hf_download.is_some() {
+        return vec![("Esc/q/c", "cancel download")];
+    }
+    if app.hf.confirm.is_some() {
+        return vec![("Enter/y", "download"), ("Esc/q/n", "cancel")];
+    }
+    if app.hf.details_open {
+        return vec![
+            ("↑↓/jk", "scroll"),
+            ("PgUp/PgDn", "page"),
+            ("Home/End", "first/last"),
+            ("Enter/Esc/q/i", "close details"),
+        ];
+    }
     if app.key_help {
         return vec![("Enter/Esc/q/?", "close controls")];
+    }
+    if app.hf.editing {
+        return vec![
+            ("Enter", "search"),
+            ("Esc", "cancel"),
+            ("←→", "move"),
+            ("Backspace", "delete"),
+        ];
+    }
+    if app.hf.template_view.is_some() {
+        return vec![
+            ("↑↓/jk", "scroll"),
+            ("PgUp/PgDn", "page"),
+            ("Home/End", "first/last"),
+            ("s", "save to library"),
+            ("Esc/q/i", "close"),
+        ];
+    }
+    if app.template_editor.is_some() {
+        return vec![
+            ("Ctrl+S", "save"),
+            ("Esc", "cancel"),
+            ("↑↓/←→", "move cursor"),
+            ("Enter", "new line"),
+            ("Backspace", "delete"),
+        ];
+    }
+    if app.template_name_input.is_some() {
+        return vec![("Enter", "confirm"), ("Esc", "cancel")];
+    }
+    if app.template_delete_confirm.is_some() {
+        return vec![("Enter/y", "delete"), ("Esc/q/n", "cancel")];
     }
     if app.profile_delete_confirm.is_some() {
         return vec![("Enter/y", "delete"), ("Esc/q/n", "cancel")];
@@ -2664,6 +3928,14 @@ fn page_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             ("↑↓/jk", "select"),
             ("Home/End", "first/last"),
             ("Enter", "confirm"),
+            ("Esc/q", "cancel"),
+        ];
+    }
+    if app.template_picker.is_some() {
+        return vec![
+            ("↑↓/jk", "select"),
+            ("Home/End", "first/last"),
+            ("Enter", "apply"),
             ("Esc/q", "cancel"),
         ];
     }
@@ -2703,7 +3975,7 @@ fn page_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             ("?", "controls"),
             ("q", "quit"),
         ],
-        2 => vec![
+        3 => vec![
             ("Enter", "load"),
             ("m/v", "benchmark/results"),
             ("e/R/c/d", "edit/rename/clone/delete"),
@@ -2714,15 +3986,62 @@ fn page_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             ("?", "controls"),
             ("q", "quit"),
         ],
-        3 => vec![
+        5 => vec![
             ("Enter/+/-", "change"),
             ("r", "refresh"),
             ("?", "controls"),
             ("q", "quit"),
         ],
-        4 => vec![("r", "refresh"), ("?", "controls"), ("q", "quit")],
-        5 => vec![
+        6 => vec![("r", "refresh"), ("?", "controls"), ("q", "quit")],
+        7 => vec![
             ("Enter", "run action"),
+            ("r", "refresh"),
+            ("?", "controls"),
+            ("q", "quit"),
+        ],
+        4 if app.hf.search_templates && !app.hf.template_hits.is_empty() => vec![
+            ("Enter", "open template"),
+            ("/ or s", "search"),
+            ("t", "GGUF mode"),
+            ("r", "repeat search"),
+            ("?", "controls"),
+            ("q", "quit"),
+        ],
+        4 if app.hf.search_templates => vec![
+            ("Enter, /, or s", "search"),
+            ("t", "GGUF mode"),
+            ("?", "controls"),
+            ("q", "quit"),
+        ],
+        4 if app.hf.repository.is_some() => vec![
+            ("Enter", "review download"),
+            ("i", "model card"),
+            ("b/Esc", "back"),
+            ("t", "template mode"),
+            ("r", "reload"),
+            ("?", "controls"),
+            ("q", "quit"),
+        ],
+        4 if app.hf.repositories.is_empty() => vec![
+            ("Enter, /, or s", "search"),
+            ("t", "template mode"),
+            ("?", "controls"),
+            ("q", "quit"),
+        ],
+        4 => vec![
+            ("/ or s", "search"),
+            ("Enter", "open repository"),
+            ("i", "model card"),
+            ("t", "template mode"),
+            ("r", "repeat search"),
+            ("?", "controls"),
+            ("q", "quit"),
+        ],
+        2 => vec![
+            ("Enter/e", "edit"),
+            ("a", "add"),
+            ("R", "rename"),
+            ("d", "delete"),
             ("r", "refresh"),
             ("?", "controls"),
             ("q", "quit"),
@@ -2763,7 +4082,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     if area.width < 72 || area.height < 18 {
         frame.render_widget(
             Paragraph::new(
-                "llamactl NEO\n\nResize terminal to at least 72×18.\nq quit · r refresh",
+                "llamactl NEO\n\nResize terminal to at least 72×18.\nq quit - r refresh",
             )
             .style(Style::default().fg(Color::Yellow)),
             area,
@@ -2789,7 +4108,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 .unwrap_or(text.len());
             text.insert(byte, '▏');
             (
-                format!(" {}: {text} · Enter confirm · Esc cancel", prompt.label),
+                format!(" {}: {text} - Enter confirm - Esc cancel", prompt.label),
                 Color::DarkGray,
             )
         } else if editor.notice.is_empty() {
@@ -2806,7 +4125,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             .unwrap_or(text.len());
         text.insert(byte, '▏');
         (
-            format!(" RENAME PROFILE → {text} · Enter confirm · Esc cancel"),
+            format!(" RENAME PROFILE → {text} - Enter confirm - Esc cancel"),
             Color::DarkGray,
         )
     } else if let Some(task) = &app.background {
@@ -2845,7 +4164,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         .enumerate()
         .map(|(i, n)| {
             let mut line = Line::from(format!("{}. {n}", i + 1));
-            if i == 5
+            if i == 7
                 && app
                     .last_check
                     .as_ref()
@@ -2884,19 +4203,25 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     match app.page {
         0 => dashboard(frame, app, body[1]),
         1 => model_page(frame, app, body[1]),
-        2 => {
+        2 => template_page(frame, app, body[1]),
+        3 => {
             if let Some(editor) = &app.profile_editor {
                 profile_editor_view(frame, app, editor, body[1]);
             } else {
                 profile_page(frame, app, body[1]);
             }
         }
-        3 => settings_page(frame, app, body[1]),
-        4 => logs(frame, app, body[1]),
-        _ => system(frame, app, body[1]),
+        4 => hf_download_page(frame, app, body[1]),
+        5 => settings_page(frame, app, body[1]),
+        6 => logs(frame, app, body[1]),
+        7 => system(frame, app, body[1]),
+        _ => dashboard(frame, app, body[1]),
     }
     if let Some(picker) = &app.runtime_picker {
         runtime_picker_modal(frame, picker, area);
+    }
+    if let Some(picker) = &app.template_picker {
+        template_picker_modal(frame, picker, area);
     }
     if let Some(view) = &app.benchmark_view {
         benchmark_modal(frame, view, area);
@@ -2910,13 +4235,39 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     if let Some(dialog) = &app.benchmark_dialog {
         benchmark_dialog_modal(frame, dialog, area, &mut app.throbber_state);
     }
+    if app.hf.editing {
+        hf_search_modal(frame, &app.hf, area);
+    }
+    if app.hf.details_open
+        && let Some(details) = &app.hf.details
+    {
+        hf_model_details_modal(frame, details, app.hf.detail_scroll, area);
+    }
+    if let Some(selection) = &app.hf.confirm {
+        hf_download_confirm_modal(frame, selection, area);
+    }
+    if let Some(download) = &app.hf_download {
+        hf_download_progress_modal(frame, download, area, &mut app.throbber_state);
+    }
+    if let Some(view) = &app.hf.template_view {
+        hf_template_view_modal(frame, view, area);
+    }
+    if let Some(editor) = &app.template_editor {
+        template_editor_modal(frame, editor, area);
+    }
+    if let Some(input) = &app.template_name_input {
+        template_name_modal(frame, input, area);
+    }
+    if let Some(name) = &app.template_delete_confirm {
+        template_delete_modal(frame, name, area);
+    }
     if app.key_help {
         keyboard_help_modal(frame, area);
     }
 }
 fn keyboard_help_modal(frame: &mut ratatui::Frame, area: Rect) {
     let width = area.width.saturating_sub(8).min(88);
-    let height = 17.min(area.height.saturating_sub(2));
+    let height = 19.min(area.height.saturating_sub(2));
     let modal = Rect::new(
         area.x + (area.width - width) / 2,
         area.y + (area.height - height) / 2,
@@ -2928,7 +4279,7 @@ fn keyboard_help_modal(frame: &mut ratatui::Frame, area: Rect) {
         ("Home / End", "select first/last item"),
         ("←/→ or h/l", "switch workspace"),
         ("Tab / Shift+Tab", "switch workspace"),
-        ("1–6", "jump directly to a workspace"),
+        ("1–8", "jump directly to a workspace"),
         ("Enter", "run the primary action"),
         ("r", "refresh the current state"),
         ("?", "open or close this control reference"),
@@ -2941,6 +4292,10 @@ fn keyboard_help_modal(frame: &mut ratatui::Frame, area: Rect) {
             "Profiles: t / f / k",
             "split mode / flash attention / KV cache",
         ),
+        ("Search: / or s / i", "search / open model card"),
+        ("Search: t", "toggle GGUF / Jinja template search"),
+        ("Search: b", "back to results"),
+        ("Templates: e / a / R / d", "edit / add / rename / delete"),
     ]
     .map(|(key, action)| Row::new([key, action]));
     frame.render_widget(Clear, modal);
@@ -2979,7 +4334,7 @@ fn profile_delete_modal(frame: &mut ratatui::Frame, profile: &str, area: Rect) {
             Line::from("This also deletes its retained benchmark results."),
             Line::from(""),
             Line::from(Span::styled(
-                "Enter/y delete · Esc/q/n cancel",
+                "Enter/y delete - Esc/q/n cancel",
                 Style::default().fg(Color::DarkGray),
             )),
         ])
@@ -3011,6 +4366,46 @@ fn rename_modal(frame: &mut ratatui::Frame, state: &RenameState, area: Rect) {
         modal,
     );
 }
+fn hf_search_modal(frame: &mut ratatui::Frame, browser: &HfBrowser, area: Rect) {
+    let width = area.width.saturating_sub(12).min(80);
+    let height = 7.min(area.height.saturating_sub(2));
+    let modal = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    let mut query = browser.query.clone();
+    query.insert(char_byte_index(&query, browser.cursor), '▏');
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                "Search public, non-gated GGUF repositories.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Query  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    query,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Enter search - Esc cancel",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])
+        .block(title("SEARCH HUGGING FACE").padding(Padding::horizontal(1)))
+        .wrap(Wrap { trim: false }),
+        modal,
+    );
+}
+
 fn benchmark_dialog_modal(
     frame: &mut ratatui::Frame,
     dialog: &BenchmarkDialog,
@@ -3047,7 +4442,7 @@ fn benchmark_dialog_modal(
                 Line::from("Loading or interacting with models would invalidate the results."),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "Enter/y run · Esc/q/n cancel",
+                    "Enter/y run - Esc/q/n cancel",
                     Style::default().fg(Color::DarkGray),
                 )),
             ])
@@ -3061,6 +4456,9 @@ fn benchmark_dialog_modal(
             runtime,
             effective_context,
             load_ms,
+            benchmark_started_at,
+            case_started_at,
+            case_elapsed,
             completed,
             ..
         } => {
@@ -3076,6 +4474,31 @@ fn benchmark_dialog_modal(
                     .throbber_style(Style::default().fg(Color::Cyan)),
                 Rect { height: 1, ..inner },
                 throbber_state,
+            );
+            let current_elapsed = case_started_at
+                .as_ref()
+                .map(|started_at| started_at.elapsed())
+                .or_else(|| (!completed.is_empty()).then_some(*case_elapsed));
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("Current ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        current_elapsed
+                            .map(format_benchmark_elapsed)
+                            .unwrap_or_else(|| "--".into()),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled("   Total ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        format_benchmark_elapsed(benchmark_started_at.elapsed()),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                ])),
+                Rect {
+                    y: inner.y + 1,
+                    height: 1,
+                    ..inner
+                },
             );
             let metadata = if let Some(context) = effective_context {
                 benchmark_metadata_line(runtime, *context, load_ms.unwrap_or_default())
@@ -3109,7 +4532,7 @@ fn benchmark_dialog_modal(
             );
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
-                    "Controls locked · Esc/q/c cancels",
+                    "Controls locked - Esc/q/c cancels",
                     Style::default().fg(Color::DarkGray),
                 ))),
                 Rect {
@@ -3139,13 +4562,13 @@ fn benchmark_modal(frame: &mut ratatui::Frame, view: &BenchmarkView, area: Rect)
     for (index, run) in view.runs.iter().rev().enumerate() {
         let y = inner.y + index as u16 * 5;
         let partial = if run.cases.len() < 3 {
-            " · PARTIAL"
+            " - PARTIAL"
         } else {
             ""
         };
         let mut heading = vec![Span::styled(
             format!(
-                "RUN {}{partial} · {}   ",
+                "RUN {}{partial} - {}   ",
                 view.runs.len() - index,
                 run.profile
             ),
@@ -3174,6 +4597,18 @@ fn benchmark_modal(frame: &mut ratatui::Frame, view: &BenchmarkView, area: Rect)
         );
     }
 }
+fn format_benchmark_elapsed(elapsed: Duration) -> String {
+    let total = elapsed.as_secs_f64();
+    let hours = (total / 3600.0) as u64;
+    let minutes = ((total / 60.0) as u64) % 60;
+    let seconds = total % 60.0;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:04.1}")
+    } else {
+        format!("{minutes:02}:{seconds:04.1}")
+    }
+}
+
 fn benchmark_metadata_line(runtime: &str, context: u64, load_ms: u64) -> Line<'static> {
     Line::from(vec![
         Span::styled("Runtime ", Style::default().fg(Color::DarkGray)),
@@ -3290,6 +4725,42 @@ fn runtime_picker_modal(frame: &mut ratatui::Frame, picker: &RuntimePicker, area
         &mut state,
     );
 }
+fn template_picker_modal(frame: &mut ratatui::Frame, picker: &TemplatePicker, area: Rect) {
+    let content_width = picker
+        .options
+        .iter()
+        .map(|name| name.chars().count())
+        .max()
+        .unwrap_or(0) as u16;
+    let width = (content_width + 6).clamp(48, area.width.saturating_sub(4));
+    let height = (picker.options.len() as u16 + 2).clamp(5, area.height.saturating_sub(4));
+    let modal = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, modal);
+    let items = picker
+        .options
+        .iter()
+        .map(|name| ListItem::new(name.as_str()))
+        .collect::<Vec<_>>();
+    let mut state = ListState::default().with_selected(Some(picker.selected));
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(title("SELECT TEMPLATE").padding(Padding::horizontal(1)))
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("› "),
+        modal,
+        &mut state,
+    );
+}
 fn draw_telemetry_strip(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let cards = Layout::default()
         .direction(Direction::Horizontal)
@@ -3356,7 +4827,7 @@ fn draw_telemetry_strip(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         ("✓ SERVING".to_owned(), Color::Green)
     } else {
         let (icon, status, color) = match t.model_state {
-            ModelState::Loading => ("◐ ", "· LOADING", Color::Yellow),
+            ModelState::Loading => ("◐ ", "- LOADING", Color::Yellow),
             _ => ("● ", "", Color::Green),
         };
 
@@ -3444,23 +4915,15 @@ fn estimate_card(
     area: Rect,
     title: &'static str,
     estimate: Option<u64>,
-    available: u64,
+    capacity: u64,
     color: Color,
 ) {
     let ratio = estimate
-        .filter(|_| available > 0)
-        .map(|estimate| estimate as f64 / available as f64)
+        .filter(|_| capacity > 0)
+        .map(|estimate| estimate as f64 / capacity as f64)
         .unwrap_or_default();
-    let label = match estimate {
-        Some(estimate) if available > 0 => format!(
-            "{:.0}/{:.0}MiB - {:.1}%",
-            estimate as f64 / (1u64 << 20) as f64,
-            available as f64 / (1u64 << 20) as f64,
-            ratio * 100.0,
-        ),
-        Some(estimate) => format!("{:.0}MiB - --", estimate as f64 / (1u64 << 20) as f64),
-        None => "Estimating…".into(),
-    };
+    let label = estimate_card_label(estimate, capacity);
+
     frame.render_widget(
         Gauge::default()
             .block(compact_block(title))
@@ -3469,6 +4932,19 @@ fn estimate_card(
             .gauge_style(Style::default().fg(color)),
         area,
     );
+}
+
+fn estimate_card_label(estimate: Option<u64>, capacity: u64) -> String {
+    match estimate {
+        Some(estimate) if capacity > 0 => format!(
+            "{:.0} MiB / {:.0} MiB - {:.1}%",
+            estimate as f64 / (1u64 << 20) as f64,
+            capacity as f64 / (1u64 << 20) as f64,
+            estimate as f64 * 100.0 / capacity as f64,
+        ),
+        Some(estimate) => format!("{:.0} MiB - --", estimate as f64 / (1u64 << 20) as f64),
+        None => "Estimating…".into(),
+    }
 }
 
 fn residence_card(
@@ -3568,7 +5044,7 @@ fn dashboard(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     };
     let server_lines: Vec<Line> = vec![
         Line::from(vec![Span::styled(
-            format!("{status_icon} {status_text} · pid {}", pid.unwrap_or(0)),
+            format!("{status_icon} {status_text} - pid {}", pid.unwrap_or(0)),
             Style::default()
                 .fg(status_color)
                 .add_modifier(Modifier::BOLD),
@@ -3750,7 +5226,7 @@ fn dashboard(frame: &mut ratatui::Frame, app: &App, area: Rect) {
             )];
             if app.telemetry.model_state == ModelState::Loading {
                 header_spans.push(Span::styled(
-                    " · LOADING",
+                    " - LOADING",
                     Style::default().fg(Color::DarkGray),
                 ));
             }
@@ -3848,6 +5324,977 @@ fn dashboard(frame: &mut ratatui::Frame, app: &App, area: Rect) {
         }
     }
 }
+fn hf_download_page(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    let show_context = app.hf.repository.is_some();
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(if show_context {
+            vec![
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ]
+        } else {
+            vec![Constraint::Min(1), Constraint::Length(1)]
+        })
+        .split(area);
+    let content_area = if show_context { layout[1] } else { layout[0] };
+    let save_area = if show_context { layout[2] } else { layout[1] };
+
+    if let Some(repository) = &app.hf.repository {
+        let context = Line::from(vec![
+            Span::styled(" Repository ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                repository.id.clone(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" - License ", Style::default().fg(Color::DarkGray)),
+            Span::raw(repository.license.clone()),
+        ]);
+        frame.render_widget(Paragraph::new(context), layout[0]);
+    }
+
+    let wide = content_area.width >= 95;
+    if app.hf.search_templates {
+        let rows = app
+            .hf
+            .template_hits
+            .iter()
+            .map(|hit| {
+                let preview = hit.template.split_whitespace().collect::<Vec<_>>().join(" ");
+                let preview = preview.chars().take(80).collect::<String>();
+                let mut cells = vec![
+                    Line::raw(format!(" {}", hit.id)),
+                    Line::raw(format_count(hit.downloads)),
+                ];
+                if wide {
+                    cells.push(Line::raw(format_count(hit.likes)));
+                }
+                cells.push(Line::from(Span::styled(
+                    preview,
+                    Style::default().fg(Color::DarkGray),
+                )));
+                Row::new(cells)
+            })
+            .collect::<Vec<_>>();
+        let (headers, widths) = if wide {
+            (
+                vec!["REPOSITORY", "DOWNLOADS", "LIKES", "PREVIEW"],
+                vec![
+                    Constraint::Percentage(40),
+                    Constraint::Length(12),
+                    Constraint::Length(9),
+                    Constraint::Min(20),
+                ],
+            )
+        } else {
+            (
+                vec!["REPOSITORY", "DOWNLOADS", "PREVIEW"],
+                vec![
+                    Constraint::Percentage(40),
+                    Constraint::Length(12),
+                    Constraint::Min(20),
+                ],
+            )
+        };
+        let table = Table::new(rows, widths)
+            .header(
+                Row::new(headers).style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            )
+            .row_highlight_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("› ")
+            .highlight_spacing(HighlightSpacing::Always)
+            .block(title("JINJA TEMPLATES"));
+        let mut state = ratatui::widgets::TableState::default()
+            .with_selected((!app.hf.template_hits.is_empty()).then_some(app.selected));
+        frame.render_stateful_widget(table, content_area, &mut state);
+    } else if app.hf.repository.is_some() {
+        let rows = app
+            .hf
+            .artifacts
+            .iter()
+            .map(|artifact| {
+                let mut label = vec![Span::raw(format!(" {}", artifact.label))];
+                if artifact.recommended {
+                    label.push(Span::styled(
+                        "  RECOMMENDED",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                }
+                let mut notes = artifact.description.clone();
+                if artifact.has_mmproj {
+                    notes.push_str(" - vision included");
+                }
+                if !artifact.complete {
+                    notes.push_str(" - incomplete shards");
+                }
+                let mut cells = vec![Line::from(label), Line::raw(format_bytes(artifact.size))];
+                if wide {
+                    cells.push(Line::raw(format!("{}/5", artifact.quality)));
+                    cells.push(Line::raw(if artifact.shard_count > 1 {
+                        format!("{} shards", artifact.shard_count)
+                    } else {
+                        "1 file".into()
+                    }));
+                }
+                cells.push(Line::from(Span::styled(
+                    notes,
+                    Style::default().fg(if artifact.complete {
+                        Color::DarkGray
+                    } else {
+                        Color::Yellow
+                    }),
+                )));
+                Row::new(cells)
+            })
+            .collect::<Vec<_>>();
+        let (headers, widths) = if wide {
+            (
+                vec!["QUANTIZATION", "SIZE", "QUALITY", "FILES", "NOTES"],
+                vec![
+                    Constraint::Percentage(28),
+                    Constraint::Length(11),
+                    Constraint::Length(9),
+                    Constraint::Length(11),
+                    Constraint::Min(20),
+                ],
+            )
+        } else {
+            (
+                vec!["QUANTIZATION", "SIZE", "NOTES"],
+                vec![
+                    Constraint::Percentage(38),
+                    Constraint::Length(11),
+                    Constraint::Min(12),
+                ],
+            )
+        };
+        let table = Table::new(rows, widths)
+            .header(
+                Row::new(headers).style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            )
+            .row_highlight_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("› ")
+            .highlight_spacing(HighlightSpacing::Always)
+            .block(title("GGUF QUANTIZATIONS"));
+        let mut state = ratatui::widgets::TableState::default()
+            .with_selected((!app.hf.artifacts.is_empty()).then_some(app.selected));
+        frame.render_stateful_widget(table, content_area, &mut state);
+    } else {
+        let rows = app
+            .hf
+            .repositories
+            .iter()
+            .map(|repository| {
+                let mut cells = vec![
+                    Line::raw(format!(" {}", repository.id)),
+                    Line::raw(format_count(repository.downloads)),
+                ];
+                if wide {
+                    cells.push(Line::raw(format_count(repository.likes)));
+                }
+                cells.push(Line::raw(repository.license.clone()));
+                if wide {
+                    cells.push(Line::raw(repository.updated.clone()));
+                }
+                Row::new(cells)
+            })
+            .collect::<Vec<_>>();
+        let (headers, widths) = if wide {
+            (
+                vec!["REPOSITORY", "DOWNLOADS", "LIKES", "LICENSE", "UPDATED"],
+                vec![
+                    Constraint::Percentage(48),
+                    Constraint::Length(12),
+                    Constraint::Length(9),
+                    Constraint::Length(16),
+                    Constraint::Length(12),
+                ],
+            )
+        } else {
+            (
+                vec!["REPOSITORY", "DOWNLOADS", "LICENSE"],
+                vec![
+                    Constraint::Percentage(55),
+                    Constraint::Length(12),
+                    Constraint::Min(10),
+                ],
+            )
+        };
+        let table = Table::new(rows, widths)
+            .header(
+                Row::new(headers).style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            )
+            .row_highlight_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("› ")
+            .highlight_spacing(HighlightSpacing::Always)
+            .block(title("PUBLIC GGUF MODELS"));
+        let mut state = ratatui::widgets::TableState::default()
+            .with_selected((!app.hf.repositories.is_empty()).then_some(app.selected));
+        frame.render_stateful_widget(table, content_area, &mut state);
+    }
+
+    let empty = if app.hf.search_templates {
+        app.hf.template_hits.is_empty()
+    } else {
+        app.hf.repositories.is_empty() && app.hf.repository.is_none()
+    };
+    if app.hf.request_rx.is_some() {
+        let spinner = spinner_char(app.marquee_started.elapsed());
+        let message = if app.notice.contains("model card") {
+            "Loading model card…"
+        } else if app.notice.contains("GGUF files") {
+            "Reading repository files…"
+        } else if app.hf.search_templates {
+            "Searching Hugging Face for chat templates…"
+        } else {
+            "Searching Hugging Face…"
+        };
+        let inner = Rect {
+            x: content_area.x + 2,
+            y: content_area.y + 2,
+            width: content_area.width.saturating_sub(4),
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!("{spinner} "), Style::default().fg(Color::Cyan)),
+                Span::styled(message, Style::default().fg(Color::DarkGray)),
+            ])),
+            inner,
+        );
+    } else if empty {
+        let inner = Rect {
+            x: content_area.x + 3,
+            y: content_area.y + 2,
+            width: content_area.width.saturating_sub(4),
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "Only public, non-gated repositories are shown.",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            inner,
+        );
+    }
+
+    let destinations = app.hf_destinations();
+    let destination = &destinations[app.hf.destination % destinations.len()];
+    frame.render_widget(
+        Paragraph::new(format!(" Save to {}", destination.display())),
+        save_area,
+    );
+}
+
+fn template_page(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    let rows = app
+        .templates
+        .templates
+        .iter()
+        .map(|(name, template)| {
+            let size = format_bytes(template.len() as u64);
+            let preview = template.split_whitespace().collect::<Vec<_>>().join(" ");
+            let preview = preview.chars().take(60).collect::<String>();
+            Row::new(vec![
+                Span::raw(format!(" {}", name)),
+                Span::raw(size),
+                Span::styled(preview, Style::default().fg(Color::DarkGray)),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(30),
+            Constraint::Length(10),
+            Constraint::Percentage(50),
+        ],
+    )
+    .header(
+        Row::new(["NAME", "SIZE", "PREVIEW"]).style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    )
+    .row_highlight_style(
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol("› ")
+    .highlight_spacing(HighlightSpacing::Always)
+    .block(title("JINJA TEMPLATES"));
+    let mut state = ratatui::widgets::TableState::default()
+        .with_selected((!app.templates.templates.is_empty()).then_some(app.selected));
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn hf_template_view_modal(frame: &mut ratatui::Frame, view: &TemplateView, area: Rect) {
+    let width = area.width.saturating_sub(8).min(120);
+    let height = area.height.saturating_sub(4).min(34);
+    let modal = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, modal);
+    let block = title("JINJA TEMPLATE").padding(Padding::horizontal(1));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            view.id.clone(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))),
+        Rect { height: 1, ..inner },
+    );
+
+    let body_y = inner.y + 2;
+    let body_height = inner.bottom().saturating_sub(body_y).saturating_sub(1);
+    let lines = view
+        .template
+        .lines()
+        .map(|line| Line::raw(line.to_owned()))
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((view.scroll, 0))
+            .wrap(Wrap { trim: false }),
+        Rect {
+            x: inner.x,
+            y: body_y,
+            width: inner.width,
+            height: body_height,
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "s save to library - Esc/q/i close - ↑↓/PgUp/PgDn scroll",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        Rect {
+            y: inner.bottom().saturating_sub(1),
+            height: 1,
+            ..inner
+        },
+    );
+}
+
+fn template_editor_modal(frame: &mut ratatui::Frame, editor: &TemplateEditor, area: Rect) {
+    let width = area.width.saturating_sub(8).min(120);
+    let height = area.height.saturating_sub(2).max(12);
+    let modal = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, modal);
+    let heading = if editor.is_new {
+        "NEW TEMPLATE"
+    } else {
+        "EDIT TEMPLATE"
+    };
+    let block = title(heading).padding(Padding::horizontal(1));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Name  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                editor.name.clone(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        Rect { height: 1, ..inner },
+    );
+
+    let body_y = inner.y + 2;
+    let body_height = inner.bottom().saturating_sub(body_y).saturating_sub(1);
+    let visible = body_height as usize;
+    let total_lines = editor.lines.len();
+    let scroll = editor
+        .line
+        .saturating_sub(visible / 2)
+        .min(total_lines.saturating_sub(visible.max(1)));
+
+    let mut lines = Vec::new();
+    for (index, line) in editor.lines.iter().enumerate().skip(scroll).take(visible) {
+        if index == editor.line {
+            let mut text = line.clone();
+            let byte = char_byte_index(&text, editor.col);
+            text.insert(byte, '▏');
+            lines.push(Line::from(Span::styled(
+                text,
+                Style::default().fg(Color::White),
+            )));
+        } else {
+            lines.push(Line::raw(line.clone()));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        Rect {
+            x: inner.x,
+            y: body_y,
+            width: inner.width,
+            height: body_height,
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "Ctrl+S save - Esc cancel",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        Rect {
+            y: inner.bottom().saturating_sub(1),
+            height: 1,
+            ..inner
+        },
+    );
+}
+
+fn template_name_modal(frame: &mut ratatui::Frame, input: &TemplateNameInput, area: Rect) {
+    let width = area.width.saturating_sub(12).min(80);
+    let height = 5;
+    let modal = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    let mut text = input.text.clone();
+    let byte = char_byte_index(&text, input.cursor);
+    text.insert(byte, '▏');
+    let heading = if input.rename.is_some() {
+        "RENAME TEMPLATE"
+    } else {
+        "NEW TEMPLATE"
+    };
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(format!("\n{text}"))
+            .block(title(heading).padding(Padding::horizontal(1))),
+        modal,
+    );
+}
+
+fn template_delete_modal(frame: &mut ratatui::Frame, name: &str, area: Rect) {
+    let width = area.width.saturating_sub(12).min(80);
+    let height = 6;
+    let modal = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                format!("Permanently delete template {name}?"),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Enter/y delete - Esc/q/n cancel",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])
+        .block(title("DELETE TEMPLATE").padding(Padding::horizontal(1)))
+        .wrap(Wrap { trim: false }),
+        modal,
+    );
+}
+
+fn hf_model_details_modal(
+    frame: &mut ratatui::Frame,
+    details: &huggingface::ModelDetails,
+    scroll: u16,
+    area: Rect,
+) {
+    let width = area.width.saturating_sub(8).min(120);
+    let height = area.height.saturating_sub(4).min(34);
+    let modal = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, modal);
+    let block = title("MODEL CARD").padding(Padding::horizontal(1));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    let languages = if details.languages.is_empty() {
+        "unknown".into()
+    } else {
+        details.languages.join(", ")
+    };
+    let tags = if details.tags.is_empty() {
+        "none".into()
+    } else {
+        details.tags.join(" - ")
+    };
+    let metadata = vec![
+        Line::from(Span::styled(
+            details.id.clone(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled("Author ", Style::default().fg(Color::DarkGray)),
+            Span::raw(details.author.clone()),
+            Span::styled("   License ", Style::default().fg(Color::DarkGray)),
+            Span::raw(details.license.clone()),
+            Span::styled("   Updated ", Style::default().fg(Color::DarkGray)),
+            Span::raw(details.updated.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("Downloads ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format_count(details.downloads)),
+            Span::styled("   Likes ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format_count(details.likes)),
+            Span::styled("   Task ", Style::default().fg(Color::DarkGray)),
+            Span::raw(details.task.clone()),
+            Span::styled("   Library ", Style::default().fg(Color::DarkGray)),
+            Span::raw(details.library.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("Base model ", Style::default().fg(Color::DarkGray)),
+            Span::raw(details.base_model.clone()),
+            Span::styled("   Languages ", Style::default().fg(Color::DarkGray)),
+            Span::raw(languages),
+        ]),
+        Line::from(vec![
+            Span::styled("Tags ", Style::default().fg(Color::DarkGray)),
+            Span::raw(tags),
+        ]),
+        Line::from(vec![
+            Span::styled("Page ", Style::default().fg(Color::DarkGray)),
+            Span::styled(details.url.clone(), Style::default().fg(Color::Cyan)),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(metadata).wrap(Wrap { trim: false }),
+        Rect {
+            height: 6.min(inner.height),
+            ..inner
+        },
+    );
+
+    let body_y = inner.y + 7;
+    let body_height = inner.bottom().saturating_sub(body_y).saturating_sub(1);
+    let readme = if details.readme.is_empty() {
+        vec![Line::from(Span::styled(
+            "No README model card was provided.",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        details.readme.lines().map(model_card_line).collect()
+    };
+    frame.render_widget(
+        Paragraph::new(readme)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0))
+            .block(
+                Block::default()
+                    .title(Span::styled(
+                        " README ",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                    .borders(Borders::TOP)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            ),
+        Rect {
+            x: inner.x,
+            y: body_y,
+            width: inner.width,
+            height: body_height,
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(
+                "Line {} - ↑↓/PgUp/PgDn scroll - Enter/Esc/q/i close",
+                scroll + 1
+            ),
+            Style::default().fg(Color::DarkGray),
+        ))),
+        Rect {
+            y: inner.bottom().saturating_sub(1),
+            height: 1,
+            ..inner
+        },
+    );
+}
+
+static MODEL_CARD_INLINE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(\*\*([^*]+)\*\*|__([^_]+)__|`([^`]+)`|\[([^\]]+)\]\(([^)]+)\))").unwrap()
+});
+
+fn model_card_line(line: &str) -> Line<'static> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('#') {
+        model_card_inline(
+            trimmed.trim_start_matches('#').trim(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if trimmed.starts_with("```") {
+        Line::from(Span::styled(
+            trimmed.trim_matches('`').trim().to_owned(),
+            Style::default().fg(Color::DarkGray),
+        ))
+    } else if let Some(text) = trimmed.strip_prefix('>') {
+        model_card_inline(text.trim_start(), Style::default().fg(Color::DarkGray))
+    } else if let Some(text) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("+ "))
+    {
+        let mut spans = vec![Span::styled("- ", Style::default().fg(Color::Cyan))];
+        spans.extend(model_card_inline_spans(text, Style::default()));
+        Line::from(spans)
+    } else if matches!(trimmed, "---" | "***" | "___") {
+        Line::from(Span::styled(
+            "─".repeat(24),
+            Style::default().fg(Color::DarkGray),
+        ))
+    } else {
+        model_card_inline(line, Style::default())
+    }
+}
+
+fn model_card_inline(text: &str, style: Style) -> Line<'static> {
+    Line::from(model_card_inline_spans(text, style))
+}
+
+fn model_card_inline_spans(text: &str, style: Style) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut end = 0;
+    for capture in MODEL_CARD_INLINE_RE.captures_iter(text) {
+        let matched = capture.get(0).expect("full inline markup match");
+        if matched.start() > end {
+            spans.push(Span::styled(text[end..matched.start()].to_owned(), style));
+        }
+        if let Some(content) = capture.get(2).or_else(|| capture.get(3)) {
+            spans.push(Span::styled(
+                content.as_str().to_owned(),
+                style.add_modifier(Modifier::BOLD),
+            ));
+        } else if let Some(code) = capture.get(4) {
+            spans.push(Span::styled(
+                code.as_str().to_owned(),
+                Style::default().fg(Color::Yellow),
+            ));
+        } else if let Some(label) = capture.get(5) {
+            spans.push(Span::styled(
+                label.as_str().to_owned(),
+                style.fg(Color::Cyan).add_modifier(Modifier::UNDERLINED),
+            ));
+        }
+        end = matched.end();
+    }
+    if end < text.len() {
+        spans.push(Span::styled(text[end..].to_owned(), style));
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(String::new(), style));
+    }
+    spans
+}
+
+fn hf_download_confirm_modal(
+    frame: &mut ratatui::Frame,
+    selection: &HfDownloadSelection,
+    area: Rect,
+) {
+    let width = area.width.saturating_sub(8).min(100);
+    let height = 10.min(area.height.saturating_sub(2));
+    let modal = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                format!("{} - {}", selection.repository.id, selection.artifact.label),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Size  ", Style::default().fg(Color::DarkGray)),
+                Span::raw(format_bytes(selection.artifact.size)),
+                Span::styled("   Files  ", Style::default().fg(Color::DarkGray)),
+                Span::raw(selection.artifact.files.len().to_string()),
+                Span::styled("   License  ", Style::default().fg(Color::DarkGray)),
+                Span::raw(selection.repository.license.clone()),
+            ]),
+            Line::from(vec![
+                Span::styled("Destination  ", Style::default().fg(Color::DarkGray)),
+                Span::raw(selection.destination.display().to_string()),
+            ]),
+            Line::from(vec![
+                Span::styled("Verification  ", Style::default().fg(Color::DarkGray)),
+                Span::raw("size + Hugging Face LFS SHA-256"),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Enter/y download - Esc/q/n cancel",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])
+        .block(title("DOWNLOAD MODEL").padding(Padding::horizontal(1)))
+        .wrap(Wrap { trim: false }),
+        modal,
+    );
+}
+
+fn hf_download_progress_modal(
+    frame: &mut ratatui::Frame,
+    download: &HfDownloadDialog,
+    area: Rect,
+    throbber_state: &mut ThrobberState,
+) {
+    let width = area.width.saturating_sub(8).min(100);
+    let height = 11.min(area.height.saturating_sub(2));
+    let modal = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, modal);
+    let block = title("MODEL DOWNLOAD").padding(Padding::horizontal(1));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    frame.render_stateful_widget(
+        Throbber::default()
+            .label(download.phase.clone())
+            .style(Style::default().fg(if download.cancelling {
+                Color::Yellow
+            } else {
+                Color::White
+            }))
+            .throbber_style(Style::default().fg(Color::Cyan)),
+        Rect { height: 1, ..inner },
+        throbber_state,
+    );
+
+    let total = download.files.values().sum::<u64>();
+    let completed = download.progress.values().sum::<u64>().min(total);
+    let ratio = if total > 0 {
+        completed as f64 / total as f64
+    } else {
+        0.0
+    };
+    frame.render_widget(
+        Gauge::default()
+            .ratio(ratio.clamp(0.0, 1.0))
+            .label(format!("{:.1}%", ratio * 100.0))
+            .gauge_style(Style::default().fg(Color::Cyan)),
+        Rect {
+            y: inner.y + 2,
+            height: 1,
+            ..inner
+        },
+    );
+
+    let elapsed = download.started_at.elapsed();
+    let transferred = download
+        .progress
+        .iter()
+        .map(|(path, current)| {
+            current.saturating_sub(download.baseline.get(path).copied().unwrap_or(0))
+        })
+        .sum::<u64>();
+    let speed = if elapsed.as_secs_f64() > 0.0 {
+        transferred as f64 / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Progress ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!(
+                "{} / {}",
+                format_bytes(completed),
+                format_bytes(total)
+            )),
+            Span::styled("   Average ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}/s", format_bytes(speed as u64)),
+                Style::default().fg(Color::Green),
+            ),
+            Span::styled("   Elapsed ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format_benchmark_elapsed(elapsed),
+                Style::default().fg(Color::Yellow),
+            ),
+        ])),
+        Rect {
+            y: inner.y + 3,
+            height: 1,
+            ..inner
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Repository ", Style::default().fg(Color::DarkGray)),
+            Span::raw(download.repository.clone()),
+            Span::styled("   Files ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!(
+                "{}/{}",
+                download.completed_files,
+                download.files.len()
+            )),
+        ])),
+        Rect {
+            y: inner.y + 4,
+            height: 1,
+            ..inner
+        },
+    );
+    let current = if download.current.is_empty() {
+        "Preparing…".into()
+    } else {
+        marquee_text(
+            &download.current,
+            inner.width.saturating_sub(10) as usize,
+            elapsed,
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Current ", Style::default().fg(Color::DarkGray)),
+            Span::raw(current),
+        ])),
+        Rect {
+            y: inner.y + 5,
+            height: 1,
+            ..inner
+        },
+    );
+    let detail = download.retry.as_deref().unwrap_or(if download.cancelling {
+        "Waiting for active network reads to stop; partial files are retained"
+    } else {
+        "Ranged transfers resume automatically; every LFS file is verified"
+    });
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            detail.to_owned(),
+            Style::default().fg(if download.retry.is_some() || download.cancelling {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            }),
+        )),
+        Rect {
+            y: inner.y + 6,
+            height: 1,
+            ..inner
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(
+                "Save to {} - Controls locked - Esc/q/c cancels",
+                download.destination.display()
+            ),
+            Style::default().fg(Color::DarkGray),
+        ))),
+        Rect {
+            y: inner.bottom().saturating_sub(1),
+            height: 1,
+            ..inner
+        },
+    );
+}
+
+fn format_bytes(bytes: u64) -> String {
+    let gib = 1u64 << 30;
+    let mib = 1u64 << 20;
+    if bytes >= gib {
+        format!("{:.1} GiB", bytes as f64 / gib as f64)
+    } else if bytes >= mib {
+        format!("{:.1} MiB", bytes as f64 / mib as f64)
+    } else {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    }
+}
+
+fn format_count(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}K", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+fn spinner_char(elapsed: Duration) -> char {
+    let spinner = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+    spinner
+        .chars()
+        .nth((elapsed.as_millis() / 100) as usize % spinner.chars().count())
+        .unwrap_or('-')
+}
+
 fn model_page(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let visible = app.visible_models();
     let mut mains = Vec::new();
@@ -3937,24 +6384,18 @@ fn profile_editor_view(frame: &mut ratatui::Frame, app: &App, editor: &ProfileEd
         .direction(Direction::Horizontal)
         .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
         .split(layout[1]);
-    let free_vram = app
-        .telemetry
-        .vram_total
-        .saturating_sub(app.telemetry.vram_used);
-    let free_ram = app
-        .telemetry
-        .ram_total
-        .saturating_sub(app.telemetry.ram_used);
+    let total_vram = app.telemetry.vram_total;
+    let total_ram = app.telemetry.ram_total;
     let estimate = match &editor.estimate {
         EstimateState::Pending => None,
         EstimateState::Ready(estimate) => Some(estimate),
     };
     let vram_color = estimate.map_or(Color::DarkGray, |estimate| {
-        if free_vram > 0 && estimate.vram as f64 <= free_vram as f64 * 0.85 {
+        if total_vram > 0 && estimate.vram as f64 <= total_vram as f64 * 0.85 {
             Color::Green
-        } else if free_vram > 0 && estimate.vram <= free_vram {
+        } else if total_vram > 0 && estimate.vram <= total_vram {
             Color::Yellow
-        } else if free_vram > 0 {
+        } else if total_vram > 0 {
             Color::Red
         } else {
             Color::DarkGray
@@ -3965,7 +6406,7 @@ fn profile_editor_view(frame: &mut ratatui::Frame, app: &App, editor: &ProfileEd
         estimate_cards[0],
         "EST. VRAM",
         estimate.map(|estimate| estimate.vram),
-        free_vram,
+        total_vram,
         vram_color,
     );
     estimate_card(
@@ -3973,7 +6414,7 @@ fn profile_editor_view(frame: &mut ratatui::Frame, app: &App, editor: &ProfileEd
         estimate_cards[1],
         "EST. RAM",
         estimate.map(|estimate| estimate.ram),
-        free_ram,
+        total_ram,
         if estimate.is_some() {
             Color::Cyan
         } else {
@@ -3989,9 +6430,9 @@ fn profile_editor_view(frame: &mut ratatui::Frame, app: &App, editor: &ProfileEd
         Paragraph::new(Line::from(vec![
             Span::styled(" Profile ", Style::default().fg(Color::DarkGray)),
             Span::raw(editor.name.clone()),
-            Span::styled(" · Model ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" - Model ", Style::default().fg(Color::DarkGray)),
             Span::raw(editor.owner.clone()),
-            Span::styled(" · File ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" - File ", Style::default().fg(Color::DarkGray)),
             Span::raw(filename),
         ])),
         layout[0],
@@ -4012,6 +6453,8 @@ fn profile_editor_view(frame: &mut ratatui::Frame, app: &App, editor: &ProfileEd
                     } else {
                         "off".to_owned()
                     }
+                } else if field == EditorField::ChatTemplate {
+                    chat_template_display(app, &editor.settings)
                 } else {
                     editor_field_value(field, &editor.settings)
                 };
@@ -4099,6 +6542,14 @@ const EDITOR_BASIC_CATEGORIES: &[EditorCategory] = &[
         ],
     },
 ];
+const EDITOR_TEMPLATE_CATEGORY: EditorCategory = EditorCategory {
+    label: "CHAT TEMPLATE",
+    fields: &[
+        EditorField::Jinja,
+        EditorField::ChatTemplate,
+        EditorField::ChatTemplateKwargs,
+    ],
+};
 const EDITOR_ADVANCED_CATEGORY: EditorCategory = EditorCategory {
     label: "ADVANCED",
     fields: &[
@@ -4107,10 +6558,6 @@ const EDITOR_ADVANCED_CATEGORY: EditorCategory = EditorCategory {
         EditorField::RopeScale,
         EditorField::Seed,
         EditorField::Reasoning,
-        EditorField::Jinja,
-        EditorField::ChatTemplate,
-        EditorField::ChatTemplateFile,
-        EditorField::ChatTemplateKwargs,
     ],
 };
 const EDITOR_PROFILE_CATEGORY: EditorCategory = EditorCategory {
@@ -4128,6 +6575,14 @@ fn editor_rows(advanced: bool) -> Vec<EditorRow> {
         rows.push(EditorRow::Header(category.label));
         rows.extend(category.fields.iter().copied().map(EditorRow::Field));
     }
+    rows.push(EditorRow::Header(EDITOR_TEMPLATE_CATEGORY.label));
+    rows.extend(
+        EDITOR_TEMPLATE_CATEGORY
+            .fields
+            .iter()
+            .copied()
+            .map(EditorRow::Field),
+    );
     rows.push(EditorRow::Field(EditorField::Advanced));
     if advanced {
         rows.push(EditorRow::Header(EDITOR_ADVANCED_CATEGORY.label));
@@ -4155,6 +6610,7 @@ fn editor_fields(advanced: bool) -> Vec<EditorField> {
     for category in EDITOR_BASIC_CATEGORIES {
         fields.extend_from_slice(category.fields);
     }
+    fields.extend_from_slice(EDITOR_TEMPLATE_CATEGORY.fields);
     fields.push(EditorField::Advanced);
     if advanced {
         fields.extend_from_slice(EDITOR_ADVANCED_CATEGORY.fields);
@@ -4214,7 +6670,6 @@ fn editor_field_label(field: EditorField) -> &'static str {
         EditorField::Reasoning => "Reasoning",
         EditorField::Jinja => "Jinja templates",
         EditorField::ChatTemplate => "Chat template",
-        EditorField::ChatTemplateFile => "Chat template file",
         EditorField::ChatTemplateKwargs => "Template kwargs",
     }
 }
@@ -4324,13 +6779,6 @@ fn editor_field_value(field: EditorField, settings: &EditorSettings) -> String {
                 settings.chat_template.clone()
             }
         }
-        EditorField::ChatTemplateFile => {
-            if settings.chat_template_file.is_empty() {
-                "—".into()
-            } else {
-                settings.chat_template_file.clone()
-            }
-        }
         EditorField::ChatTemplateKwargs => {
             if settings.chat_template_kwargs.is_empty() {
                 "—".into()
@@ -4340,6 +6788,37 @@ fn editor_field_value(field: EditorField, settings: &EditorSettings) -> String {
         }
     }
 }
+fn chat_template_display(app: &App, settings: &EditorSettings) -> String {
+    if settings.chat_template.is_empty() {
+        return "(model default)".into();
+    }
+    if let Some((name, _)) = app
+        .templates
+        .templates
+        .iter()
+        .find(|(_, template)| *template == &settings.chat_template)
+    {
+        return name.clone();
+    }
+    let preview = settings
+        .chat_template
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut text = preview.chars().take(44).collect::<String>();
+    if preview.chars().count() > 44 {
+        text.push('…');
+    }
+    text
+}
+fn step_nonnegative(value: u64, direction: i32) -> u64 {
+    if direction < 0 {
+        value.saturating_sub(1)
+    } else {
+        value.saturating_add(1)
+    }
+}
+
 fn editor_settings_from_profile(profile: &serde_json::Map<String, Value>) -> EditorSettings {
     let u = |key: &str, default: u64| {
         profile
@@ -5623,6 +8102,34 @@ fn serving_telemetry(cfg: &Config, paths: &Paths) -> Telemetry {
 }
 
 #[cfg(test)]
+mod model_card_tests {
+    use super::*;
+
+    #[test]
+    fn renders_markdown_without_exposing_inline_markup() {
+        let heading = model_card_line("## Model **Name**");
+        assert_eq!(
+            heading
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "Model Name"
+        );
+        assert!(heading.spans[0].style.add_modifier.contains(Modifier::BOLD));
+
+        let body = model_card_line("Read [the docs](https://example.com) and use `f16`.");
+        assert_eq!(
+            body.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "Read the docs and use f16."
+        );
+    }
+}
+
+#[cfg(test)]
 mod telemetry_tests {
     use super::*;
     use serde_json::json;
@@ -5687,7 +8194,7 @@ mod rename_editing_tests {
     #[test]
     fn editing_supports_arrows_home_end_and_insert_at_cursor() {
         let mut app = app();
-        app.page = 2;
+        app.page = 3;
         app.selected = 0;
         app.start_profile_rename();
         let original = app.rename_input.as_ref().unwrap().original.clone();
@@ -5728,7 +8235,7 @@ mod rename_editing_tests {
     #[test]
     fn ctrl_edits_delete_word_line_and_jump_words() {
         let mut app = app();
-        app.page = 2;
+        app.page = 3;
         app.selected = 0;
         app.start_profile_rename();
         let state = app.rename_input.as_ref().unwrap().clone();
@@ -5764,6 +8271,23 @@ mod profile_editor_tests {
 
     fn map(value: serde_json::Value) -> serde_json::Map<String, Value> {
         value.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn draft_token_step_stops_at_zero() {
+        assert_eq!(step_nonnegative(3, -1), 2);
+        assert_eq!(step_nonnegative(0, -1), 0);
+        assert_eq!(step_nonnegative(3, 1), 4);
+    }
+
+    #[test]
+    fn estimate_card_labels_both_values_in_mib() {
+        let mib = 1u64 << 20;
+        assert_eq!(
+            estimate_card_label(Some(8192 * mib), 16384 * mib),
+            "8192 MiB / 16384 MiB - 50.0%"
+        );
+        assert_eq!(estimate_card_label(Some(8192 * mib), 0), "8192 MiB - --");
     }
 
     #[test]

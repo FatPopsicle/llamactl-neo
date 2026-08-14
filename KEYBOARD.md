@@ -10,7 +10,7 @@ llamactl NEO uses the same navigation and confirmation rules throughout the TUI.
 | `Home` / `End` | Select the first or last item |
 | `Left` / `Right`, `h` / `l` | Switch workspace |
 | `Tab` / `Shift+Tab` | Switch workspace forward or backward |
-| `1`–`6` | Jump to Dashboard, Models, Profiles, Settings, Logs, or Maintenance |
+| `1`–`7` | Jump to Dashboard, Models, Profiles, Settings, Logs, Maintenance, or Downloads |
 | `Enter` | Run the selected workspace's primary action |
 | `r` | Refresh application state |
 | `?` | Open or close the in-app control reference |
@@ -77,6 +77,19 @@ Navigation keys are contextual inside editors and modals. For example, arrow key
 |---|---|
 | `Enter` | Run the selected maintenance action |
 
+### Downloads
+
+| Key | Action |
+|---|---|
+| `/` / `s` | Edit the Hugging Face search query |
+| `Enter` | Open search when no results are listed; otherwise open the selected repository/model card or review the selected quantization |
+| `i` | Open or reopen the selected repository’s model card |
+| `d` | Cycle through configured model-directory destinations |
+| `b` / `Esc` | Return from quantizations to repository results |
+| `r` | Repeat the search or reload repository files |
+
+Search results include only public, non-gated GGUF repositories. Opening a result first shows a scrollable model card with repository metadata, its Hugging Face URL, and README; use arrows or Page Up/Page Down to scroll and Enter or Esc to continue to quantizations. The confirmation dialog shows size, file count, license, destination, and verification mode. During a transfer, unrelated controls are locked; `Esc`, `q`, `c`, or `Ctrl+C` cancels while retaining resumable partial files.
+
 ## Profile Editor
 
 | Key | Action |
@@ -88,7 +101,7 @@ Navigation keys are contextual inside editors and modals. For example, arrow key
 | `Enter`, `s` | Save the profile |
 | `Esc`, `q` | Cancel editing |
 
-`Context step` appears directly below `Context size`. Use left/right to select a standard increment from 1,024 to 65,536 tokens, or press `t` to enter an exact increment in that range. It controls context adjustments in Settings, Profiles, and the Profile Editor.
+`Context step` appears directly below `Context size`. Use left/right to select a standard increment from 1,024 to 65,536 tokens, or press `t` to enter an exact increment in that range. It controls context adjustments in Settings, Profiles, and the Profile Editor. On `Draft tokens`, left/right or `h`/`l` decreases or increases the amount by one, stopping at zero.
 
 ## Pickers and result views
 

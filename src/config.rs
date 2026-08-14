@@ -33,6 +33,7 @@ pub struct Paths {
     pub swap_config: PathBuf,
     pub metadata_cache: PathBuf,
     pub profile_benchmarks: PathBuf,
+    pub templates: PathBuf,
 }
 
 impl Paths {
@@ -62,6 +63,7 @@ impl Paths {
             swap_config: state_dir.join("llama-swap.yaml"),
             metadata_cache: state_dir.join("gguf-metadata-cache.json"),
             profile_benchmarks: state_dir.join("profile-benchmarks.json"),
+            templates: config_dir.join("templates"),
             data_dir,
             state_dir,
         })

@@ -18,7 +18,7 @@ A short visual guide for keeping llamactl NEO consistent.
 - Use one character of horizontal padding inside modal borders.
 - Keep modals only as tall as their content requires.
 - Keep border titles to one uppercase label; put profile names, controls, and other context in the body or footer.
-- Put controls last: `Enter/y confirm · Esc/n cancel`.
+- Put controls last: `Enter/y confirm - Esc/n cancel`.
 - Destructive confirmation text should be yellow and bold, not decorative.
 
 ## Tables and metrics
@@ -35,7 +35,7 @@ A short visual guide for keeping llamactl NEO consistent.
 
 - Use uppercase for card titles, table headings, and fixed category names.
 - Use bold sparingly for titles, selections, and primary identifiers.
-- Prefer concise labels and middle-dot separators: `value · value`.
+- Prefer concise labels and dash separators: `value - value`.
 - Use at most one blank line between related sections.
 - Avoid repeating the same metadata in both a heading and the body.
 

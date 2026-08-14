@@ -148,6 +148,10 @@ fn flag_value(args: &[String], flags: &[&str]) -> Option<String> {
         .map(|pair| pair[1].clone())
 }
 
+fn flag_value_u64(args: &[String], flags: &[&str]) -> Option<u64> {
+    flag_value(args, flags).and_then(|v| v.parse::<u64>().ok())
+}
+
 pub fn validate_draft_model(main: Option<&Path>, args: &[String]) -> Result<()> {
     let Some(main) = main else { return Ok(()) };
     let Some(raw) = flag_value(args, &["--spec-draft-model", "--model-draft", "-md"]) else {
@@ -500,6 +504,7 @@ pub fn write_swap_config(cfg: &Config, paths: &Paths, profiles: &Profiles) -> Re
         }
     }
     text.push_str("models:\n");
+    let mut metadata = BTreeMap::new();
     for entry in &entries {
         let mut args = vec![binary.display().to_string()];
         args.extend(models::model_args(&entry.path));
@@ -560,6 +565,16 @@ pub fn write_swap_config(cfg: &Config, paths: &Paths, profiles: &Profiles) -> Re
                 ),
             );
         }
+        let ctx_size = flag_value_u64(&args, &["--ctx-size", "-c"]).unwrap_or(4096);
+        let has_vision = args.iter().any(|a| a == "--mmproj");
+        metadata.insert(
+            entry.id.clone(),
+            serde_json::json!({
+                "contextWindow": ctx_size,
+                "maxTokens": 32768,
+                "hasVision": has_vision
+            }),
+        );
         text.push_str(&format!(
             "  {}:\n    cmd: {}\n    ttl: {ttl}\n",
             serde_json::to_string(&entry.id)?,
@@ -604,6 +619,7 @@ pub fn write_swap_config(cfg: &Config, paths: &Paths, profiles: &Profiles) -> Re
     let mut file = tempfile::NamedTempFile::new_in(&paths.state_dir)?;
     file.write_all(text.as_bytes())?;
     file.persist(&paths.swap_config).map_err(|e| e.error)?;
+    crate::config::atomic_json(&paths.state_dir.join("model-metadata.json"), &metadata)?;
     Ok(entries.len())
 }
 

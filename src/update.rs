@@ -130,7 +130,7 @@ pub fn build_source(_cfg: &Config, paths: &Paths, backend: &str) -> Result<()> {
         "https://github.com/{LLAMA_REPO}/archive/refs/tags/{}.tar.gz",
         release.tag_name
     );
-    eprintln!("• downloading llama.cpp {} source", release.tag_name);
+    eprintln!("- downloading llama.cpp {} source", release.tag_name);
     let response = reqwest::blocking::Client::new()
         .get(source_url)
         .header("User-Agent", "llamactl-rust")
@@ -263,7 +263,7 @@ fn prune_versions(cfg: &Config, paths: &Paths) -> Result<()> {
 }
 
 fn download(asset: &Asset) -> Result<reqwest::blocking::Response> {
-    eprintln!("• downloading {}", asset.name);
+    eprintln!("- downloading {}", asset.name);
     Ok(reqwest::blocking::Client::new()
         .get(&asset.browser_download_url)
         .header("User-Agent", "llamactl-rust")

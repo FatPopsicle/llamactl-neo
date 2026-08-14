@@ -28,6 +28,7 @@ use std::{
 
 const OUTPUT_TOKENS: u64 = 256;
 const CASES: [(&str, f64); 3] = [("small", 0.05), ("medium", 0.25), ("long", 0.75)];
+const CANCEL_TERM_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -85,6 +86,7 @@ pub enum BenchmarkProgress {
     CaseStarted {
         name: String,
         target_prompt_tokens: u64,
+        started_at: Instant,
     },
     CaseCompleted(BenchmarkCase),
     RestoringServer,
@@ -230,6 +232,10 @@ fn run_inner(
     if was_running {
         emit(&progress, BenchmarkProgress::StoppingServer);
         process::stop(paths)?;
+        if cancelled.load(Ordering::Relaxed) {
+            restore_server(cfg, paths, profiles, was_running, service_was_active)?;
+            bail!("benchmark cancelled")
+        }
     }
     emit(&progress, BenchmarkProgress::LoadingRuntime);
     let started = Instant::now();
@@ -257,9 +263,19 @@ fn run_inner(
         thread::spawn(move || {
             while !done.load(Ordering::Relaxed) {
                 if cancelled.load(Ordering::Relaxed) {
+                    let process_group = format!("-{child_id}");
                     let _ = Command::new("kill")
-                        .args(["-TERM", &format!("-{child_id}")])
+                        .args(["-TERM", &process_group])
                         .status();
+                    let deadline = Instant::now() + CANCEL_TERM_GRACE;
+                    while Instant::now() < deadline && !done.load(Ordering::Relaxed) {
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                    if !done.load(Ordering::Relaxed) {
+                        let _ = Command::new("kill")
+                            .args(["-KILL", &process_group])
+                            .status();
+                    }
                     break;
                 }
                 thread::sleep(Duration::from_millis(100));
@@ -327,6 +343,7 @@ fn run_inner(
                 BenchmarkProgress::CaseStarted {
                     name: name.to_owned(),
                     target_prompt_tokens: target,
+                    started_at: Instant::now(),
                 },
             );
             let case = run_case(&client, &base, name, target, prompt, child_id)?;
@@ -381,7 +398,7 @@ pub fn summary(run: &BenchmarkRun) -> String {
         .iter()
         .map(|case| {
             format!(
-                "{} pp {:.1} · dec {:.1} · peak {:.1} · median {:.1} · first {:.2}s",
+                "{} pp {:.1} - dec {:.1} - peak {:.1} - median {:.1} - first {:.2}s",
                 case.name,
                 case.prompt_tokens_per_second,
                 case.decode_tokens_per_second,
@@ -393,12 +410,12 @@ pub fn summary(run: &BenchmarkRun) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     let status = if run.cases.len() < CASES.len() {
-        " · partial"
+        " - partial"
     } else {
         ""
     };
     format!(
-        "profile {}{status} · runtime {} · ctx {} · load {:.2}s\n{}",
+        "profile {}{status} - runtime {} - ctx {} - load {:.2}s\n{}",
         run.profile,
         run.runtime,
         run.effective_context,

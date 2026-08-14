@@ -3,7 +3,7 @@ name = "llamactl"
 version = "0.17.0"
 edition = "2024"
 description = "Native llama.cpp runtime manager with a Ratatui interface"
-license = "MIT"
+license = "MIT AND Apache-2.0"
 
 [[bin]]
 name = "llamactl"

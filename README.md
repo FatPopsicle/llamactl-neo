@@ -39,7 +39,9 @@ llamactl status
 llamactl --help
 ```
 
-The UI has six workspaces: Dashboard, Models, Profiles, Settings, Logs, and Maintenance. Use arrow keys or `1`–`6` to navigate, Enter to act, `r` to refresh, `?` for the in-app control reference, and `q` to quit. See [KEYBOARD.md](KEYBOARD.md) for the complete keyboard guide.
+The UI has seven workspaces: Dashboard, Models, Profiles, Settings, Logs, Maintenance, and Downloads. Use arrow keys or `1`–`7` to navigate, Enter to act, `r` to refresh, `?` for the in-app control reference, and `q` to quit. See [KEYBOARD.md](KEYBOARD.md) for the complete keyboard guide.
+
+The Downloads workspace searches public, non-gated GGUF repositories on Hugging Face without requiring an account or the `hf` CLI. Opening a result shows a scrollable model card with repository metadata, its Hugging Face page URL, and README before quantization selection. It groups split shards, recommends balanced quantizations, includes a preferred multimodal projector when needed, resumes interrupted ranged transfers, and verifies Hugging Face LFS SHA-256 digests. Downloads are written under the selected configured `models_dirs` root; press `d` to cycle roots.
 
 ## Configuration
 
@@ -74,6 +76,7 @@ llamactl profiles benchmarks quality
 - `src/config.rs` — XDG paths, typed config, atomic persistence
 - `src/benchmark.rs` — isolated profile benchmarks and two-run result history
 - `src/models.rs` — GGUF discovery, split shards, IDs, deletion
+- `src/huggingface.rs` — public GGUF search, planning, resumable ranged downloads, verification
 - `src/profiles.rs` — compatible profile storage and argument generation
 - `src/process.rs` — commands, background lifecycle, swap configuration
 - `src/update.rs` — GitHub release installation and source builds
