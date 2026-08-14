@@ -1014,7 +1014,11 @@ pub fn estimate(path: &Path, args: &[String]) -> Estimate {
     let vram =
         ((gpu_weights + projector + draft) * 1.03 + (kv + buffers) * 1.03 * context_cal) as u64;
 
-    let ram_weights = (weights as f64 - gpu_weights).max(0.0) + draft * 0.01;
+    // RAM here means model data that must remain resident because it was not
+    // placed on the GPU. Do not add generic process overhead or mmap-backed
+    // GPU weights: a fully offloaded profile should correctly report zero
+    // estimated RAM spill.
+    let ram_weights = (weights as f64 - gpu_weights).max(0.0);
     let ram_kv = (kv_full - kv).max(0.0);
     let cpu_layer_frac = if layers > 0 {
         (layers - ngl.min(layers)) as f64 / layers as f64
@@ -1022,7 +1026,7 @@ pub fn estimate(path: &Path, args: &[String]) -> Estimate {
         0.0
     };
     let ram_overhead = buffers * cpu_layer_frac;
-    let ram = ((ram_weights + ram_kv + ram_overhead + 1e9) * 1.05) as u64;
+    let ram = ((ram_weights + ram_kv + ram_overhead) * 1.05) as u64;
     Estimate { vram, ram }
 }
 

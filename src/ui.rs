@@ -1,4 +1,5 @@
 use crate::{
+    benchmark,
     config::{Config, Paths},
     models, process, profiles,
     profiles::Profiles,
@@ -14,19 +15,23 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
+    symbols::border,
     text::{Line, Span},
     widgets::{
-        Block, BorderType, Borders, Gauge, List, ListItem, ListState, Paragraph, Row, Table, Wrap,
+        Block, BorderType, Borders, Clear, Gauge, List, ListItem, ListState, Padding, Paragraph,
+        Row, Table, Wrap,
     },
 };
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, VecDeque},
-    io,
+    fs, io,
     path::PathBuf,
     process::Command,
     time::{Duration, Instant},
 };
+use throbber_widgets_tui::{Throbber, ThrobberState};
+use tui_checkbox::Checkbox;
 
 const PAGES: &[&str] = &[
     "Dashboard",
@@ -44,11 +49,17 @@ struct App<'a> {
     cfg: Config,
     paths: &'a Paths,
     profiles: Profiles,
+    benchmarks: benchmark::ProfileBenchmarks,
     page: usize,
     selected: usize,
     filter: String,
     rename_input: Option<RenameState>,
+    profile_delete_confirm: Option<String>,
+    key_help: bool,
     profile_editor: Option<ProfileEditor>,
+    benchmark_view: Option<BenchmarkView>,
+    benchmark_dialog: Option<BenchmarkDialog>,
+    runtime_picker: Option<RuntimePicker>,
     background: Option<BackgroundTask>,
     last_tok: BTreeMap<String, f64>,
     profile_estimates: BTreeMap<String, (f64, f64)>,
@@ -59,15 +70,17 @@ struct App<'a> {
     scan_rx: Option<std::sync::mpsc::Receiver<(u64, Option<Vec<models::Model>>)>>,
     estimate_rx: Option<std::sync::mpsc::Receiver<ProfileEstimateUpdate>>,
     estimate_target: Option<String>,
-    telemetry_rx: Option<std::sync::mpsc::Receiver<(Telemetry, Telemetry)>>,
+    telemetry_rx: Option<std::sync::mpsc::Receiver<(Telemetry, Option<Telemetry>)>>,
     last_check: Option<UpdateStatus>,
     update_check_rx: Option<std::sync::mpsc::Receiver<Result<UpdateStatus>>>,
     log: String,
     last_refresh: Instant,
+    last_telemetry: Instant,
     telemetry: Telemetry,
     token_sample: Option<(u64, Instant)>,
     slot_samples: SlotSamples,
     marquee_started: Instant,
+    throbber_state: ThrobberState,
 }
 
 #[derive(Clone, Default)]
@@ -128,9 +141,36 @@ struct RenameState {
     cursor: usize,
 }
 
+struct RuntimePicker {
+    options: Vec<String>,
+    selected: usize,
+}
+
+struct BenchmarkView {
+    runs: Vec<benchmark::BenchmarkRun>,
+}
+
+enum BenchmarkDialog {
+    Confirm {
+        profile: String,
+    },
+    Running {
+        profile: String,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        result_rx: std::sync::mpsc::Receiver<Result<String>>,
+        progress_rx: std::sync::mpsc::Receiver<benchmark::BenchmarkProgress>,
+        phase: String,
+        runtime: String,
+        effective_context: Option<u64>,
+        load_ms: Option<u64>,
+        completed: Vec<benchmark::BenchmarkCase>,
+    },
+}
+
 #[derive(Clone)]
 struct EditorSettings {
     ctx: u64,
+    context_step: u64,
     parallel: u64,
     batch: u64,
     ubatch: u64,
@@ -172,6 +212,7 @@ impl Default for EditorSettings {
     fn default() -> Self {
         Self {
             ctx: 4096,
+            context_step: 4096,
             parallel: 1,
             batch: 2048,
             ubatch: 512,
@@ -215,6 +256,7 @@ impl Default for EditorSettings {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EditorField {
     Ctx,
+    ContextStep,
     Parallel,
     Batch,
     Ubatch,
@@ -300,20 +342,27 @@ enum ModelState {
 impl<'a> App<'a> {
     fn new(cfg: Config, paths: &'a Paths) -> Result<Self> {
         let profiles = Profiles::load(paths)?;
+        let benchmarks = benchmark::ProfileBenchmarks::load(paths).unwrap_or_default();
         Ok(Self {
             cfg,
             paths,
             profiles,
+            benchmarks,
             page: 0,
             selected: 0,
             filter: String::new(),
             rename_input: None,
+            profile_delete_confirm: None,
+            key_help: false,
             profile_editor: None,
+            benchmark_view: None,
+            benchmark_dialog: None,
+            runtime_picker: None,
             background: None,
             last_tok: BTreeMap::new(),
             profile_estimates: BTreeMap::new(),
             profile_fingerprint: String::new(),
-            notice: "Ready · arrows navigate · Enter opens · ? help".into(),
+            notice: "Ready · arrows navigate · Enter acts · ? controls".into(),
             models: Vec::new(),
             models_fingerprint: None,
             scan_rx: None,
@@ -324,15 +373,19 @@ impl<'a> App<'a> {
             update_check_rx: None,
             log: String::new(),
             last_refresh: Instant::now(),
+            last_telemetry: Instant::now(),
             telemetry: Telemetry::default(),
             token_sample: None,
             slot_samples: BTreeMap::new(),
             marquee_started: Instant::now(),
+            throbber_state: ThrobberState::default(),
         })
     }
     fn refresh(&mut self) {
         self.cfg = Config::load(self.paths).unwrap_or_else(|_| self.cfg.clone());
         self.profiles = Profiles::load(self.paths).unwrap_or_else(|_| self.profiles.clone());
+        self.benchmarks = benchmark::ProfileBenchmarks::load(self.paths)
+            .unwrap_or_else(|_| self.benchmarks.clone());
 
         // Start estimates before the recurring model scan. Previously the scan
         // was started first and start_estimates() refused to run while it was
@@ -440,7 +493,7 @@ impl<'a> App<'a> {
             }
         }
     }
-    fn start_telemetry(&mut self) {
+    fn start_telemetry(&mut self, include_serving: bool) {
         if self.telemetry_rx.is_some() {
             return;
         }
@@ -448,15 +501,26 @@ impl<'a> App<'a> {
         let paths = self.paths.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send((system_telemetry(&cfg), serving_telemetry(&cfg, &paths)));
+            let system = system_telemetry(&cfg, include_serving);
+            let serving = include_serving.then(|| serving_telemetry(&cfg, &paths));
+            let _ = tx.send((system, serving));
         });
         self.telemetry_rx = Some(rx);
+        self.last_telemetry = Instant::now();
     }
     fn poll_telemetry(&mut self) {
         let result = self.telemetry_rx.as_ref().and_then(|rx| rx.try_recv().ok());
         if let Some((system, serving)) = result {
             self.telemetry_rx = None;
-            self.apply_telemetry(system, serving);
+            if let Some(serving) = serving {
+                self.apply_telemetry(system, serving);
+            } else {
+                self.telemetry.ram_used = system.ram_used;
+                self.telemetry.ram_total = system.ram_total;
+                self.telemetry.vram_used = system.vram_used;
+                self.telemetry.vram_total = system.vram_total;
+                self.telemetry.gpu_temps = system.gpu_temps;
+            }
         }
     }
     fn start_update_check(&mut self) {
@@ -723,7 +787,15 @@ impl<'a> App<'a> {
             self.refresh();
             return;
         }
-        self.regenerate_swap_async("Saved and reloaded scheduler configuration".into());
+        let message = if self.page == 3 && self.selected == 3 {
+            format!(
+                "Selected runtime {} · restart the server to apply",
+                self.cfg.runtime
+            )
+        } else {
+            "Saved and reloaded scheduler configuration".into()
+        };
+        self.regenerate_swap_async(message);
         self.refresh();
     }
     fn toggle_setting(&mut self, direction: i32) {
@@ -736,6 +808,10 @@ impl<'a> App<'a> {
                 }
             }
             3 => {
+                self.open_runtime_picker();
+                return;
+            }
+            4 => {
                 let position = crate::config::BACKENDS
                     .iter()
                     .position(|backend| *backend == self.cfg.backend)
@@ -745,18 +821,18 @@ impl<'a> App<'a> {
                     [(position + direction).rem_euclid(length) as usize]
                     .into();
             }
-            4 => {
-                let step = if direction >= 0 { 4096 } else { -4096 };
+            5 => {
+                let step = context_step(&self.cfg) as i64 * direction.signum() as i64;
                 self.cfg.ctx_size = (self.cfg.ctx_size as i64 + step).max(1024) as u64;
             }
-            5 => self.cfg.scheduler_enabled = !self.cfg.scheduler_enabled,
-            6 => {
+            6 => self.cfg.scheduler_enabled = !self.cfg.scheduler_enabled,
+            7 => {
                 self.cfg.scheduler_vram_fraction =
                     (self.cfg.scheduler_vram_fraction + direction as f64 * 0.05).clamp(0.1, 1.0)
             }
-            8 => self.cfg.advertise_base_models = !self.cfg.advertise_base_models,
-            9 => self.cfg.advertise_profiles = !self.cfg.advertise_profiles,
-            10 => {
+            9 => self.cfg.advertise_base_models = !self.cfg.advertise_base_models,
+            10 => self.cfg.advertise_profiles = !self.cfg.advertise_profiles,
+            11 => {
                 let enable = !crate::service_enabled();
                 let paths = self.paths.clone();
                 self.spawn_task(
@@ -782,6 +858,53 @@ impl<'a> App<'a> {
             }
         }
         self.save_runtime_state();
+    }
+    fn open_runtime_picker(&mut self) {
+        let options = available_runtimes(self.paths, &self.cfg.runtime);
+        let selected = options
+            .iter()
+            .position(|runtime| runtime == &self.cfg.runtime)
+            .unwrap_or(0);
+        self.runtime_picker = Some(RuntimePicker { options, selected });
+    }
+    fn handle_runtime_picker(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.runtime_picker = None,
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(picker) = &mut self.runtime_picker {
+                    picker.selected = picker.selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(picker) = &mut self.runtime_picker {
+                    picker.selected =
+                        (picker.selected + 1).min(picker.options.len().saturating_sub(1));
+                }
+            }
+            KeyCode::Home => {
+                if let Some(picker) = &mut self.runtime_picker {
+                    picker.selected = 0;
+                }
+            }
+            KeyCode::End => {
+                if let Some(picker) = &mut self.runtime_picker {
+                    picker.selected = picker.options.len().saturating_sub(1);
+                }
+            }
+            KeyCode::Enter => {
+                let runtime = self
+                    .runtime_picker
+                    .as_ref()
+                    .and_then(|picker| picker.options.get(picker.selected))
+                    .cloned();
+                self.runtime_picker = None;
+                if let Some(runtime) = runtime {
+                    self.cfg.runtime = runtime;
+                    self.save_runtime_state();
+                }
+            }
+            _ => {}
+        }
     }
     fn create_profile_for_selected_model(&mut self) {
         let Some((model_id, model_path)) = self
@@ -885,7 +1008,8 @@ impl<'a> App<'a> {
                     .get("ctx-size")
                     .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
                     .unwrap_or(4096) as i64;
-                let direction = if key == '+' { 4096 } else { -4096 };
+                let step = context_step(&self.cfg) as i64;
+                let direction = if key == '+' { step } else { -step };
                 profile.insert(
                     "ctx-size".into(),
                     Value::from((current + direction).max(1024)),
@@ -963,6 +1087,7 @@ impl<'a> App<'a> {
             .cloned()
             .unwrap_or_default();
         let mut settings = editor_settings_from_profile(&profile);
+        settings.context_step = context_step(&self.cfg);
         if profile.get("ctx-size").is_none() {
             settings.ctx = self.cfg.ctx_size;
         }
@@ -1127,31 +1252,22 @@ impl<'a> App<'a> {
     }
     fn editor_choices(&self, field: EditorField, s: &EditorSettings) -> Vec<String> {
         let mut list: Vec<String> = match field {
-            EditorField::Ctx => self
-                .profile_editor
-                .as_ref()
-                .and_then(|editor| models::context_limit(&editor.path))
-                .map(|limit| {
-                    let mut values = [
-                        4096u64, 8192, 16_384, 32_768, 65_536, 131_072, 262_144, 524_288, 1_048_576,
-                    ]
-                    .into_iter()
-                    .filter(|value| *value <= limit)
-                    .collect::<Vec<_>>();
-                    if !values.contains(&limit) {
-                        values.push(limit);
-                    }
-                    values.push(0);
-                    values.iter().map(|value| value.to_string()).collect()
-                })
-                .unwrap_or_else(|| {
-                    [
-                        "0", "4096", "8192", "16384", "32768", "65536", "131072", "262144",
-                        "1048576",
-                    ]
-                    .map(str::to_owned)
-                    .to_vec()
-                }),
+            EditorField::Ctx => {
+                let step = s.context_step;
+                let limit = self
+                    .profile_editor
+                    .as_ref()
+                    .and_then(|editor| models::context_limit(&editor.path))
+                    .unwrap_or_else(|| s.ctx.max(self.cfg.ctx_size).max(1_048_576));
+                let mut values = (step..=limit).step_by(step as usize).collect::<Vec<_>>();
+                values.extend([0, s.ctx, limit]);
+                values.sort_unstable();
+                values.dedup();
+                values.into_iter().map(|value| value.to_string()).collect()
+            }
+            EditorField::ContextStep => ["1024", "2048", "4096", "8192", "16384", "32768", "65536"]
+                .map(str::to_owned)
+                .to_vec(),
             EditorField::Parallel => ["1", "2", "4", "8", "16"].map(str::to_owned).to_vec(),
             EditorField::Batch => ["128", "256", "512", "1024", "2048", "4096", "8192"]
                 .map(str::to_owned)
@@ -1193,6 +1309,7 @@ impl<'a> App<'a> {
         let on = || raw == "on" || raw == "true";
         match field {
             EditorField::Ctx => s.ctx = num(s.ctx),
+            EditorField::ContextStep => s.context_step = num(s.context_step).clamp(1024, 65_536),
             EditorField::Parallel => s.parallel = num(1).clamp(1, 32),
             EditorField::Batch => {
                 s.batch = num(2048);
@@ -1315,6 +1432,10 @@ impl<'a> App<'a> {
                 "Context tokens (0 = model maximum)",
                 editor.settings.ctx.to_string(),
             ),
+            EditorField::ContextStep => (
+                "Context step tokens (1024–65536)",
+                editor.settings.context_step.to_string(),
+            ),
             EditorField::Batch => ("Prompt batch size", editor.settings.batch.to_string()),
             EditorField::Ubatch => ("Physical microbatch", editor.settings.ubatch.to_string()),
             EditorField::GpuLayers => (
@@ -1422,6 +1543,15 @@ impl<'a> App<'a> {
                     }
                     Err(_) => {
                         editor.notice = "✗ Context must be a number".into();
+                        ok = false;
+                    }
+                },
+                EditorField::ContextStep => match text.parse::<u64>() {
+                    Ok(value) if (1024..=65_536).contains(&value) => {
+                        editor.settings.context_step = value
+                    }
+                    _ => {
+                        editor.notice = "✗ Context step must be between 1024 and 65536".into();
                         ok = false;
                     }
                 },
@@ -1546,7 +1676,12 @@ impl<'a> App<'a> {
         } else if self.profiles.models.get(&owner).and_then(Value::as_str) == Some(name.as_str()) {
             self.profiles.models.remove(&owner);
         }
-        match self.profiles.save(self.paths) {
+        self.cfg.context_step_scale = settings.context_step as f64 / 4096.0;
+        match self
+            .profiles
+            .save(self.paths)
+            .and_then(|_| self.cfg.save(self.paths))
+        {
             Ok(()) => {
                 self.regenerate_swap_async(format!("Saved profile {name}"));
                 self.refresh();
@@ -1647,6 +1782,28 @@ impl<'a> App<'a> {
             .unwrap_or(prompt.text.len());
         prompt.text.truncate(byte);
     }
+    fn editor_prompt_delete_word_before(&mut self) {
+        let Some(prompt) = self.editor_prompt_mut() else {
+            return;
+        };
+        let chars = prompt.text.chars().collect::<Vec<_>>();
+        let mut start = prompt.cursor;
+        while start > 0 && !chars[start - 1].is_alphanumeric() {
+            start -= 1;
+        }
+        while start > 0 && chars[start - 1].is_alphanumeric() {
+            start -= 1;
+        }
+        if start != prompt.cursor {
+            let start_byte = chars[..start].iter().map(|ch| ch.len_utf8()).sum::<usize>();
+            let end_byte = chars[..prompt.cursor]
+                .iter()
+                .map(|ch| ch.len_utf8())
+                .sum::<usize>();
+            prompt.text.drain(start_byte..end_byte);
+            prompt.cursor = start;
+        }
+    }
     fn editor_prompt_word(&mut self, dir: i32) {
         let Some(prompt) = self.editor_prompt_mut() else {
             return;
@@ -1695,7 +1852,7 @@ impl<'a> App<'a> {
             KeyCode::Char('e') if ctrl => self.editor_prompt_end(),
             KeyCode::Char('u') if ctrl => self.editor_prompt_clear_to_start(),
             KeyCode::Char('k') if ctrl => self.editor_prompt_clear_to_end(),
-            KeyCode::Char('w') if ctrl => self.editor_prompt_word(-1),
+            KeyCode::Char('w') if ctrl => self.editor_prompt_delete_word_before(),
             KeyCode::Char(c) if !c.is_control() => self.editor_prompt_insert(c),
             _ => {}
         }
@@ -1716,14 +1873,13 @@ impl<'a> App<'a> {
             KeyCode::Enter | KeyCode::Char('s') => self.save_profile_editor(),
             KeyCode::Up | KeyCode::Char('k') => {
                 if let Some(editor) = self.profile_editor.as_mut() {
-                    let count = editor.fields.len();
-                    editor.selected = (editor.selected + count - 1) % count;
+                    editor.selected = editor.selected.saturating_sub(1);
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 if let Some(editor) = self.profile_editor.as_mut() {
-                    let count = editor.fields.len();
-                    editor.selected = (editor.selected + 1) % count;
+                    editor.selected =
+                        (editor.selected + 1).min(editor.fields.len().saturating_sub(1));
                 }
             }
             KeyCode::Left | KeyCode::Char('h') => self.editor_cycle(-1),
@@ -1740,7 +1896,7 @@ impl<'a> App<'a> {
             _ => {}
         }
     }
-    fn profile_delete_selected(&mut self) {
+    fn request_profile_delete(&mut self) {
         let Some(profile) = self.selected_profile() else {
             return;
         };
@@ -1748,11 +1904,32 @@ impl<'a> App<'a> {
             self.notice = "✗ Unpin this profile before deleting it".into();
             return;
         }
+        self.profile_delete_confirm = Some(profile);
+    }
+    fn handle_profile_delete_confirm(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') => {
+                if let Some(profile) = self.profile_delete_confirm.take() {
+                    self.delete_profile(&profile);
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') => {
+                self.profile_delete_confirm = None;
+                self.notice = "Profile deletion cancelled".into();
+            }
+            _ => {}
+        }
+    }
+    fn delete_profile(&mut self, profile: &str) {
         match self
             .profiles
-            .remove(&profile)
+            .remove(profile)
             .and_then(|_| self.profiles.save(self.paths))
-        {
+            .and_then(|_| {
+                let mut benchmarks = benchmark::ProfileBenchmarks::load(self.paths)?;
+                benchmarks.remove(profile);
+                benchmarks.save(self.paths)
+            }) {
             Ok(()) => self.notice = format!("Deleted profile {profile}"),
             Err(error) => self.notice = format!("✗ {error:#}"),
         }
@@ -1966,12 +2143,164 @@ impl<'a> App<'a> {
             .profiles
             .save(self.paths)
             .and_then(|_| self.cfg.save(self.paths))
-        {
+            .and_then(|_| {
+                let mut benchmarks = benchmark::ProfileBenchmarks::load(self.paths)?;
+                benchmarks.rename(old, new);
+                benchmarks.save(self.paths)
+            }) {
             Ok(()) => {
                 self.regenerate_swap_async(format!("Renamed {old} → {new}"));
                 self.refresh();
             }
             Err(error) => self.notice = format!("✗ {error:#}"),
+        }
+    }
+    fn show_profile_benchmarks(&mut self) {
+        let Some(profile) = self.selected_profile() else {
+            return;
+        };
+        match benchmark::ProfileBenchmarks::load(self.paths) {
+            Ok(benchmarks) => {
+                let Some(runs) = benchmarks.profiles.get(&profile) else {
+                    self.notice = format!("No benchmark results for {profile}");
+                    return;
+                };
+                self.benchmark_view = Some(BenchmarkView { runs: runs.clone() });
+            }
+            Err(error) => self.notice = format!("✗ {error:#}"),
+        }
+    }
+    fn handle_benchmark_view(&mut self, key: KeyEvent) {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter) {
+            self.benchmark_view = None;
+        }
+    }
+    fn request_profile_benchmark(&mut self) {
+        if let Some(task) = &self.background {
+            self.notice = format!("Busy: {} is still running", task.label);
+            return;
+        }
+        let Some(profile) = self.selected_profile() else {
+            return;
+        };
+        self.benchmark_dialog = Some(BenchmarkDialog::Confirm { profile });
+    }
+    fn start_profile_benchmark(&mut self, profile: String) {
+        let cfg = self.cfg.clone();
+        let paths = self.paths.clone();
+        let profiles = self.profiles.clone();
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        let worker_profile = profile.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = benchmark::run_cancellable_with_progress(
+                &cfg,
+                &paths,
+                &profiles,
+                &worker_profile,
+                worker_cancelled,
+                progress_tx,
+            )
+            .map(|run| benchmark::summary(&run).replace('\n', " · "));
+            let _ = result_tx.send(result);
+        });
+        self.benchmark_dialog = Some(BenchmarkDialog::Running {
+            profile,
+            cancelled,
+            result_rx,
+            progress_rx,
+            phase: "Preparing profile…".into(),
+            runtime: String::new(),
+            effective_context: None,
+            load_ms: None,
+            completed: Vec::new(),
+        });
+    }
+    fn handle_benchmark_dialog(&mut self, key: KeyEvent) {
+        match &self.benchmark_dialog {
+            Some(BenchmarkDialog::Confirm { profile }) => match key.code {
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    let profile = profile.clone();
+                    self.start_profile_benchmark(profile);
+                }
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') | KeyCode::Char('c') => {
+                    self.benchmark_dialog = None;
+                    self.notice = "Benchmark cancelled".into();
+                }
+                _ => {}
+            },
+            Some(BenchmarkDialog::Running { cancelled, .. }) => {
+                if matches!(
+                    key.code,
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('c')
+                ) {
+                    cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.notice = "Cancelling benchmark and restoring server…".into();
+                }
+            }
+            None => {}
+        }
+    }
+    fn poll_profile_benchmark(&mut self) {
+        if let Some(BenchmarkDialog::Running {
+            progress_rx,
+            phase,
+            runtime,
+            effective_context,
+            load_ms,
+            completed,
+            ..
+        }) = &mut self.benchmark_dialog
+        {
+            while let Ok(update) = progress_rx.try_recv() {
+                match update {
+                    benchmark::BenchmarkProgress::Preparing => *phase = "Preparing profile…".into(),
+                    benchmark::BenchmarkProgress::StoppingServer => {
+                        *phase = "Stopping active server…".into()
+                    }
+                    benchmark::BenchmarkProgress::LoadingRuntime => {
+                        *phase = "Loading model and runtime…".into()
+                    }
+                    benchmark::BenchmarkProgress::Ready {
+                        runtime: ready_runtime,
+                        effective_context: context,
+                        load_ms: ready_load_ms,
+                    } => {
+                        *runtime = ready_runtime;
+                        *effective_context = Some(context);
+                        *load_ms = Some(ready_load_ms);
+                        *phase = "Runtime ready".into();
+                    }
+                    benchmark::BenchmarkProgress::CaseStarted {
+                        name,
+                        target_prompt_tokens,
+                    } => {
+                        *phase =
+                            format!("Running {name} case · {target_prompt_tokens} prompt tokens…")
+                    }
+                    benchmark::BenchmarkProgress::CaseCompleted(case) => {
+                        *phase = format!("Completed {} case", case.name);
+                        completed.push(case);
+                    }
+                    benchmark::BenchmarkProgress::RestoringServer => {
+                        *phase = "Restoring previous server…".into()
+                    }
+                }
+            }
+        }
+        let result = match &self.benchmark_dialog {
+            Some(BenchmarkDialog::Running { result_rx, .. }) => result_rx.try_recv().ok(),
+            _ => None,
+        };
+        if let Some(result) = result {
+            self.benchmark_dialog = None;
+            self.notice = match result {
+                Ok(summary) => summary,
+                Err(error) => format!("✗ {error:#}"),
+            };
+            self.refresh();
         }
     }
     fn toggle_profile_pin(&mut self) {
@@ -2100,7 +2429,7 @@ pub fn run(cfg: Config, paths: &Paths) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     let mut app = App::new(cfg, paths)?;
     app.refresh();
-    app.start_telemetry();
+    app.start_telemetry(true);
     app.start_update_check();
     let result = (|| -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -2138,27 +2467,61 @@ pub fn run(cfg: Config, paths: &Paths) -> Result<()> {
         }
         app.poll_estimates();
         loop {
-            app.poll_editor_estimate();
-            app.poll_background();
-            app.poll_scan();
-            app.poll_estimates();
+            app.poll_profile_benchmark();
+            let benchmark_running =
+                matches!(&app.benchmark_dialog, Some(BenchmarkDialog::Running { .. }));
             app.poll_telemetry();
-            app.poll_update_check();
+            if !benchmark_running {
+                app.poll_editor_estimate();
+                app.poll_background();
+                app.poll_scan();
+                app.poll_estimates();
+                app.poll_update_check();
+            }
+            if app.background.is_some() || benchmark_running {
+                app.throbber_state.calc_next();
+            }
             terminal.draw(|f| draw(f, &mut app))?;
             if event::poll(Duration::from_millis(250))? {
                 if let Event::Key(k) = event::read()? {
                     if k.kind != KeyEventKind::Press {
                         continue;
                     }
+                    if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
+                        if app.benchmark_dialog.is_some() {
+                            app.handle_benchmark_dialog(k);
+                        } else {
+                            break;
+                        }
+                        continue;
+                    }
                     match k.code {
+                        _ if app.benchmark_dialog.is_some() => app.handle_benchmark_dialog(k),
+                        _ if app.key_help => {
+                            if matches!(
+                                k.code,
+                                KeyCode::Esc
+                                    | KeyCode::Enter
+                                    | KeyCode::Char('q')
+                                    | KeyCode::Char('?')
+                            ) {
+                                app.key_help = false;
+                            }
+                        }
+                        _ if app.profile_delete_confirm.is_some() => {
+                            app.handle_profile_delete_confirm(k)
+                        }
+                        _ if app.benchmark_view.is_some() => app.handle_benchmark_view(k),
+                        _ if app.runtime_picker.is_some() => app.handle_runtime_picker(k),
                         _ if app.profile_editor.is_some() => app.handle_profile_editor(k),
                         _ if app.rename_input.is_some() => app.handle_rename_input(k),
                         KeyCode::Char('q') => break,
-                        KeyCode::Right | KeyCode::Tab => {
+                        KeyCode::Char('?') => app.key_help = true,
+                        KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
                             app.page = (app.page + 1) % PAGES.len();
                             app.selected = 0
                         }
-                        KeyCode::Left | KeyCode::BackTab => {
+                        KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => {
                             app.page = (app.page + PAGES.len() - 1) % PAGES.len();
                             app.selected = 0
                         }
@@ -2166,19 +2529,21 @@ pub fn run(cfg: Config, paths: &Paths) -> Result<()> {
                             app.page = c as usize - '1' as usize;
                             app.selected = 0
                         }
-                        KeyCode::Up => app.selected = app.selected.saturating_sub(1),
-                        KeyCode::Down => {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            app.selected = app.selected.saturating_sub(1)
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
                             app.selected = (app.selected + 1).min(app.count().saturating_sub(1))
                         }
+                        KeyCode::Home => app.selected = 0,
+                        KeyCode::End => app.selected = app.count().saturating_sub(1),
                         KeyCode::Enter => app.action(),
-                        KeyCode::Char('r') if app.page == 2 => app.start_profile_rename(),
+                        KeyCode::Char('R') if app.page == 2 => app.start_profile_rename(),
                         KeyCode::Char('e') if app.page == 2 => app.open_profile_editor(),
                         KeyCode::Char('r') => {
                             app.refresh();
                             app.notice = "Refreshed".into()
                         }
-                        KeyCode::Char('s') if app.page == 0 => app.action(),
-                        KeyCode::Char('s') if app.page == 1 => app.action(),
                         KeyCode::Char('c') if app.page == 1 => {
                             app.create_profile_for_selected_model()
                         }
@@ -2196,14 +2561,16 @@ pub fn run(cfg: Config, paths: &Paths) -> Result<()> {
                                 });
                             }
                         }
-                        KeyCode::Char('s') if app.page == 2 => app.start_exact_profile(),
+                        KeyCode::Char('m') if app.page == 2 => app.request_profile_benchmark(),
+                        KeyCode::Char('v') if app.page == 2 => app.show_profile_benchmarks(),
                         KeyCode::Char('c') if app.page == 2 => app.profile_clone_selected(),
-                        KeyCode::Char('d') if app.page == 2 => app.profile_delete_selected(),
+                        KeyCode::Char('d') if app.page == 2 => app.request_profile_delete(),
                         KeyCode::Char('p') if app.page == 2 => app.toggle_profile_pin(),
                         KeyCode::Char('b') if app.page == 2 => app.bind_selected_profile(),
                         KeyCode::Char(c) if app.page == 2 && "+-[]tfk".contains(c) => {
                             app.adjust_profile(c)
                         }
+                        KeyCode::Char('=') if app.page == 2 => app.adjust_profile('+'),
                         KeyCode::Char('u') if app.page == 2 => {
                             if let Some(profile) = app.selected_profile() {
                                 let cfg = app.cfg.clone();
@@ -2222,9 +2589,11 @@ pub fn run(cfg: Config, paths: &Paths) -> Result<()> {
                     }
                 }
             }
-            if app.last_refresh.elapsed() > Duration::from_secs(2) {
+            if app.last_telemetry.elapsed() > Duration::from_secs(2) {
+                app.start_telemetry(!benchmark_running);
+            }
+            if !benchmark_running && app.last_refresh.elapsed() > Duration::from_secs(2) {
                 app.refresh();
-                app.start_telemetry();
             }
         }
         Ok(())
@@ -2267,12 +2636,37 @@ fn draw_loading(frame: &mut ratatui::Frame, app: &App) {
     frame.render_widget(
         Paragraph::new(body)
             .style(Style::default().fg(Color::Cyan))
-            .block(title("llamactl NEO", "")),
+            .block(title("llamactl NEO")),
         center,
     );
 }
 
 fn page_keys(app: &App) -> Vec<(&'static str, &'static str)> {
+    if let Some(dialog) = &app.benchmark_dialog {
+        return match dialog {
+            BenchmarkDialog::Confirm { .. } => {
+                vec![("Enter/y", "run"), ("Esc/q/n", "cancel")]
+            }
+            BenchmarkDialog::Running { .. } => vec![("Esc/q/c", "cancel benchmark")],
+        };
+    }
+    if app.key_help {
+        return vec![("Enter/Esc/q/?", "close controls")];
+    }
+    if app.profile_delete_confirm.is_some() {
+        return vec![("Enter/y", "delete"), ("Esc/q/n", "cancel")];
+    }
+    if app.benchmark_view.is_some() {
+        return vec![("Enter/Esc", "close")];
+    }
+    if app.runtime_picker.is_some() {
+        return vec![
+            ("↑↓/jk", "select"),
+            ("Home/End", "first/last"),
+            ("Enter", "confirm"),
+            ("Esc/q", "cancel"),
+        ];
+    }
     if let Some(editor) = &app.profile_editor {
         if editor.prompt.is_some() {
             return vec![
@@ -2283,12 +2677,12 @@ fn page_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             ];
         }
         return vec![
-            ("↑↓", "field"),
-            ("←→", "value"),
+            ("↑↓/jk", "field"),
+            ("←→/hl", "value"),
             ("t", "exact"),
             ("e", "flags"),
-            ("Enter", "save"),
-            ("Esc", "cancel"),
+            ("Enter/s", "save"),
+            ("Esc/q", "cancel"),
         ];
     }
     if app.rename_input.is_some() {
@@ -2297,34 +2691,43 @@ fn page_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     match app.page {
         0 => vec![
             ("Enter", "start/stop"),
-            ("1-6", "switch page"),
-            ("P·TOK·TOK/S", "prompt · generated · rate"),
+            ("r", "refresh"),
+            ("?", "controls"),
             ("q", "quit"),
         ],
         1 => vec![
             ("Enter", "load model"),
             ("c", "create profile"),
             ("u", "unload"),
+            ("r", "refresh"),
+            ("?", "controls"),
             ("q", "quit"),
         ],
         2 => vec![
-            ("s", "load"),
-            ("e", "edit"),
-            ("b", "bind"),
-            ("p", "pin"),
-            ("u", "unload"),
-            ("r", "rename"),
-            ("c", "clone"),
-            ("d", "delete"),
-            ("+/-", "ctx"),
-            ("[]", "slots"),
+            ("Enter", "load"),
+            ("m/v", "benchmark/results"),
+            ("e/R/c/d", "edit/rename/clone/delete"),
+            ("b/p/u", "bind/pin/unload"),
+            ("+/-/[]", "context/slots"),
             ("t/f/k", "split/flash/cache"),
+            ("r", "refresh"),
+            ("?", "controls"),
             ("q", "quit"),
         ],
-        3 => vec![("Enter/+/", "change"), ("q", "quit")],
-        4 => vec![("r", "refresh"), ("q", "quit")],
-        5 => vec![("Enter", "run action"), ("q", "quit")],
-        _ => vec![("Enter", "act"), ("q", "quit")],
+        3 => vec![
+            ("Enter/+/-", "change"),
+            ("r", "refresh"),
+            ("?", "controls"),
+            ("q", "quit"),
+        ],
+        4 => vec![("r", "refresh"), ("?", "controls"), ("q", "quit")],
+        5 => vec![
+            ("Enter", "run action"),
+            ("r", "refresh"),
+            ("?", "controls"),
+            ("q", "quit"),
+        ],
+        _ => vec![("Enter", "act"), ("?", "controls"), ("q", "quit")],
     }
 }
 fn legend_line(app: &App) -> Line<'static> {
@@ -2407,14 +2810,30 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             Color::DarkGray,
         )
     } else if let Some(task) = &app.background {
-        (format!(" ⏳ {} …", task.label), Color::DarkGray)
+        (format!("{} …", task.label), Color::DarkGray)
     } else {
         (format!(" {}", app.notice), notice_color(&app.notice))
     };
-    frame.render_widget(
-        Paragraph::new(status_line).style(Style::default().fg(status_color)),
-        outer[2],
-    );
+    if app.background.is_some() {
+        let spinner_area = Rect {
+            x: outer[2].x + 1,
+            width: outer[2].width.saturating_sub(1),
+            ..outer[2]
+        };
+        frame.render_stateful_widget(
+            Throbber::default()
+                .label(status_line)
+                .style(Style::default().fg(status_color))
+                .throbber_style(Style::default().fg(Color::Cyan)),
+            spinner_area,
+            &mut app.throbber_state,
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new(status_line).style(Style::default().fg(status_color)),
+            outer[2],
+        );
+    }
     frame.render_widget(Paragraph::new(legend_line(app)), outer[3]);
     draw_telemetry_strip(frame, app, outer[0]);
     let body = Layout::default()
@@ -2476,6 +2895,400 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         4 => logs(frame, app, body[1]),
         _ => system(frame, app, body[1]),
     }
+    if let Some(picker) = &app.runtime_picker {
+        runtime_picker_modal(frame, picker, area);
+    }
+    if let Some(view) = &app.benchmark_view {
+        benchmark_modal(frame, view, area);
+    }
+    if let Some(profile) = &app.profile_delete_confirm {
+        profile_delete_modal(frame, profile, area);
+    }
+    if let Some(state) = &app.rename_input {
+        rename_modal(frame, state, area);
+    }
+    if let Some(dialog) = &app.benchmark_dialog {
+        benchmark_dialog_modal(frame, dialog, area, &mut app.throbber_state);
+    }
+    if app.key_help {
+        keyboard_help_modal(frame, area);
+    }
+}
+fn keyboard_help_modal(frame: &mut ratatui::Frame, area: Rect) {
+    let width = area.width.saturating_sub(8).min(88);
+    let height = 17.min(area.height.saturating_sub(2));
+    let modal = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    let rows = [
+        ("↑/↓ or j/k", "select previous/next item"),
+        ("Home / End", "select first/last item"),
+        ("←/→ or h/l", "switch workspace"),
+        ("Tab / Shift+Tab", "switch workspace"),
+        ("1–6", "jump directly to a workspace"),
+        ("Enter", "run the primary action"),
+        ("r", "refresh the current state"),
+        ("?", "open or close this control reference"),
+        ("q / Ctrl+C", "quit; modal q cancels instead"),
+        ("Profiles: m / v", "run benchmark / view results"),
+        ("Profiles: e / R / c / d", "edit / rename / clone / delete"),
+        ("Profiles: b / p / u", "bind / pin / unload"),
+        ("Profiles: +/- / [/]", "context size / parallel slots"),
+        (
+            "Profiles: t / f / k",
+            "split mode / flash attention / KV cache",
+        ),
+    ]
+    .map(|(key, action)| Row::new([key, action]));
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Table::new(rows, [Constraint::Length(27), Constraint::Min(1)])
+            .header(
+                Row::new(["KEY", "ACTION"]).style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            )
+            .block(title("KEYBOARD CONTROLS").padding(Padding::horizontal(1))),
+        modal,
+    );
+}
+fn profile_delete_modal(frame: &mut ratatui::Frame, profile: &str, area: Rect) {
+    let width = area.width.saturating_sub(12).min(80);
+    let height = 7.min(area.height.saturating_sub(2));
+    let modal = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                format!("Permanently delete profile {profile}?"),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from("This also deletes its retained benchmark results."),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Enter/y delete · Esc/q/n cancel",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])
+        .block(title("DELETE PROFILE").padding(Padding::horizontal(1)))
+        .wrap(Wrap { trim: false }),
+        modal,
+    );
+}
+fn rename_modal(frame: &mut ratatui::Frame, state: &RenameState, area: Rect) {
+    let width = area.width.saturating_sub(12).min(80);
+    let height = 5;
+    let modal = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    let mut text = state.text.clone();
+    let byte = text
+        .char_indices()
+        .nth(state.cursor)
+        .map(|(index, _)| index)
+        .unwrap_or(text.len());
+    text.insert(byte, '▏');
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(format!("\n{text}"))
+            .block(title("RENAME PROFILE").padding(Padding::horizontal(1))),
+        modal,
+    );
+}
+fn benchmark_dialog_modal(
+    frame: &mut ratatui::Frame,
+    dialog: &BenchmarkDialog,
+    area: Rect,
+    throbber_state: &mut ThrobberState,
+) {
+    let width = area.width.saturating_sub(8).min(100);
+    let wanted_height = match dialog {
+        BenchmarkDialog::Confirm { .. } => 8,
+        BenchmarkDialog::Running { .. } => 12,
+    };
+    let height = wanted_height.min(area.height.saturating_sub(2));
+    let modal = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, modal);
+    let block = title("PROFILE BENCHMARK").padding(Padding::horizontal(1));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+    match dialog {
+        BenchmarkDialog::Confirm { profile } => frame.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    format!("Run the full benchmark for {profile}?"),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from("The active server will be stopped and restored afterward."),
+                Line::from("Loading or interacting with models would invalidate the results."),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Enter/y run · Esc/q/n cancel",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ])
+            .wrap(Wrap { trim: false }),
+            inner,
+        ),
+        BenchmarkDialog::Running {
+            profile,
+            cancelled,
+            phase,
+            runtime,
+            effective_context,
+            load_ms,
+            completed,
+            ..
+        } => {
+            let cancelling = cancelled.load(std::sync::atomic::Ordering::Relaxed);
+            frame.render_stateful_widget(
+                Throbber::default()
+                    .label(if cancelling {
+                        format!("Cancelling {profile} and restoring server…")
+                    } else {
+                        phase.clone()
+                    })
+                    .style(Style::default().fg(Color::White))
+                    .throbber_style(Style::default().fg(Color::Cyan)),
+                Rect { height: 1, ..inner },
+                throbber_state,
+            );
+            let metadata = if let Some(context) = effective_context {
+                benchmark_metadata_line(runtime, *context, load_ms.unwrap_or_default())
+            } else {
+                Line::from(Span::styled(
+                    "Resolving profile and runtime…",
+                    Style::default().fg(Color::DarkGray),
+                ))
+            };
+            let mut metadata_spans = vec![
+                Span::styled("Profile ", Style::default().fg(Color::DarkGray)),
+                Span::raw(profile.clone()),
+                Span::raw("   "),
+            ];
+            metadata_spans.extend(metadata.spans);
+            frame.render_widget(
+                Paragraph::new(Line::from(metadata_spans)),
+                Rect {
+                    y: inner.y + 2,
+                    height: 1,
+                    ..inner
+                },
+            );
+            frame.render_widget(
+                benchmark_case_table(completed),
+                Rect {
+                    y: inner.y + 4,
+                    height: inner.height.saturating_sub(5).min(4),
+                    ..inner
+                },
+            );
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "Controls locked · Esc/q/c cancels",
+                    Style::default().fg(Color::DarkGray),
+                ))),
+                Rect {
+                    y: inner.bottom().saturating_sub(1),
+                    height: 1,
+                    ..inner
+                },
+            );
+        }
+    }
+}
+fn benchmark_modal(frame: &mut ratatui::Frame, view: &BenchmarkView, area: Rect) {
+    let width = area.width.saturating_sub(8).min(110);
+    let height = (view.runs.len() as u16 * 5 + 2)
+        .max(7)
+        .min(area.height.saturating_sub(2));
+    let modal = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, modal);
+    let block = title("PROFILE BENCHMARK").padding(Padding::horizontal(1));
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+    for (index, run) in view.runs.iter().rev().enumerate() {
+        let y = inner.y + index as u16 * 5;
+        let partial = if run.cases.len() < 3 {
+            " · PARTIAL"
+        } else {
+            ""
+        };
+        let mut heading = vec![Span::styled(
+            format!(
+                "RUN {}{partial} · {}   ",
+                view.runs.len() - index,
+                run.profile
+            ),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )];
+        heading.extend(
+            benchmark_metadata_line(&run.runtime, run.effective_context, run.load_ms).spans,
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(heading)),
+            Rect {
+                y,
+                height: 1,
+                ..inner
+            },
+        );
+        frame.render_widget(
+            benchmark_case_table(&run.cases),
+            Rect {
+                y: y + 1,
+                height: 4,
+                ..inner
+            },
+        );
+    }
+}
+fn benchmark_metadata_line(runtime: &str, context: u64, load_ms: u64) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("Runtime ", Style::default().fg(Color::DarkGray)),
+        Span::raw(runtime.to_owned()),
+        Span::styled("   Context ", Style::default().fg(Color::DarkGray)),
+        Span::raw(context.to_string()),
+        Span::styled("   Load ", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!("{:.2}s", load_ms as f64 / 1000.0)),
+    ])
+}
+fn benchmark_case_table(cases: &[benchmark::BenchmarkCase]) -> Table<'static> {
+    let rows =
+        [("small", "SMALL"), ("medium", "MEDIUM"), ("long", "LARGE")].map(|(name, label)| {
+            let case = cases.iter().find(|case| case.name == name);
+            let placeholder =
+                || Line::from(Span::styled("--", Style::default().fg(Color::DarkGray)));
+            let metric = |value: Option<f64>, color| {
+                value
+                    .map(|value| {
+                        Line::from(Span::styled(
+                            format!("{value:.1}"),
+                            Style::default().fg(color),
+                        ))
+                    })
+                    .unwrap_or_else(&placeholder)
+            };
+            Row::new(vec![
+                Line::from(Span::styled(
+                    label,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                case.map(|case| Line::raw(case.actual_prompt_tokens.to_string()))
+                    .unwrap_or_else(&placeholder),
+                metric(
+                    case.map(|case| case.prompt_tokens_per_second),
+                    Color::Yellow,
+                ),
+                metric(case.map(|case| case.decode_tokens_per_second), Color::Green),
+                metric(
+                    case.map(|case| case.decode_peak_tokens_per_second),
+                    Color::Green,
+                ),
+                metric(
+                    case.map(|case| case.decode_median_tokens_per_second),
+                    Color::Green,
+                ),
+                case.map(|case| {
+                    Line::from(Span::styled(
+                        format!("{:.2}s", case.time_to_first_response_ms / 1000.0),
+                        Style::default().fg(Color::Yellow),
+                    ))
+                })
+                .unwrap_or_else(&placeholder),
+            ])
+        });
+    Table::new(
+        rows,
+        [
+            Constraint::Length(9),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(10),
+        ],
+    )
+    .header(
+        Row::new([
+            "CASE", "TOKENS", "PP T/S", "DEC T/S", "PEAK", "MEDIAN", "FIRST",
+        ])
+        .style(
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
+    )
+}
+fn runtime_picker_modal(frame: &mut ratatui::Frame, picker: &RuntimePicker, area: Rect) {
+    let content_width = picker
+        .options
+        .iter()
+        .map(|runtime| runtime.chars().count())
+        .max()
+        .unwrap_or(0) as u16;
+    let width = (content_width + 6).clamp(48, area.width.saturating_sub(4));
+    let height = (picker.options.len() as u16 + 2).clamp(5, area.height.saturating_sub(4));
+    let modal = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, modal);
+    let items = picker
+        .options
+        .iter()
+        .map(|runtime| ListItem::new(runtime.as_str()))
+        .collect::<Vec<_>>();
+    let mut state = ListState::default().with_selected(Some(picker.selected));
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(title("SELECT RUNTIME").padding(Padding::horizontal(1)))
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("› "),
+        modal,
+        &mut state,
+    );
 }
 fn draw_telemetry_strip(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let cards = Layout::default()
@@ -2582,7 +3395,7 @@ fn draw_telemetry_strip(frame: &mut ratatui::Frame, app: &App, area: Rect) {
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("  TOK/S ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  T/S ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 rate,
                 Style::default()
@@ -2613,6 +3426,51 @@ fn compact_block(title: impl Into<String>) -> Block<'static> {
         .border_style(Style::default().fg(Color::DarkGray))
 }
 
+fn tree_slot_block(slot_id: usize, has_next: bool) -> Block<'static> {
+    let tree_border = border::Set {
+        top_left: "├",
+        bottom_left: if has_next { "├" } else { "╰" },
+        ..border::ROUNDED
+    };
+    Block::default()
+        .title(format!("─ SLOT {slot_id} "))
+        .borders(Borders::ALL)
+        .border_set(tree_border)
+        .border_style(Style::default().fg(Color::DarkGray))
+}
+
+fn estimate_card(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    title: &'static str,
+    estimate: Option<u64>,
+    available: u64,
+    color: Color,
+) {
+    let ratio = estimate
+        .filter(|_| available > 0)
+        .map(|estimate| estimate as f64 / available as f64)
+        .unwrap_or_default();
+    let label = match estimate {
+        Some(estimate) if available > 0 => format!(
+            "{:.0}/{:.0}MiB - {:.1}%",
+            estimate as f64 / (1u64 << 20) as f64,
+            available as f64 / (1u64 << 20) as f64,
+            ratio * 100.0,
+        ),
+        Some(estimate) => format!("{:.0}MiB - --", estimate as f64 / (1u64 << 20) as f64),
+        None => "Estimating…".into(),
+    };
+    frame.render_widget(
+        Gauge::default()
+            .block(compact_block(title))
+            .ratio(ratio.clamp(0.0, 1.0))
+            .label(label)
+            .gauge_style(Style::default().fg(color)),
+        area,
+    );
+}
+
 fn residence_card(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -2628,7 +3486,7 @@ fn residence_card(
     };
     let label = if total > 0 {
         format!(
-            "{:.1}/{:.1}G · {:.0}%",
+            "{:.1}/{:.1}G - {:.0}%",
             used as f64 / (1u64 << 30) as f64,
             total as f64 / (1u64 << 30) as f64,
             ratio * 100.0
@@ -2675,21 +3533,14 @@ fn temperature_color(temperatures: &[f64]) -> Color {
     }
 }
 
-fn title(name: &str, sub: &str) -> Block<'static> {
-    let mut spans = vec![Span::styled(
-        format!(" {} ", name.to_uppercase()),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )];
-    if !sub.is_empty() {
-        spans.push(Span::styled(
-            format!(" / {sub} "),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
+fn title(name: &str) -> Block<'static> {
     Block::default()
-        .title(Line::from(spans))
+        .title(Line::from(Span::styled(
+            format!(" {} ", name.to_uppercase()),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Cyan))
@@ -2717,35 +3568,35 @@ fn dashboard(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     };
     let server_lines: Vec<Line> = vec![
         Line::from(vec![Span::styled(
-            format!(" {status_icon} {status_text} · pid {}", pid.unwrap_or(0)),
+            format!("{status_icon} {status_text} · pid {}", pid.unwrap_or(0)),
             Style::default()
                 .fg(status_color)
                 .add_modifier(Modifier::BOLD),
         )]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("endpoint  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Endpoint  ", Style::default().fg(Color::DarkGray)),
             Span::raw(format!("http://{}:{}/v1", app.cfg.host, app.cfg.port)),
         ]),
         Line::from(vec![
-            Span::styled("auth      ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Auth      ", Style::default().fg(Color::DarkGray)),
             Span::raw(format!("{} API key(s)", app.cfg.keys().len())),
         ]),
         Line::from(vec![
-            Span::styled("runtime   ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Runtime   ", Style::default().fg(Color::DarkGray)),
             Span::raw(format!("llama.cpp {}", version)),
         ]),
         Line::from(vec![
-            Span::styled("models    ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Models    ", Style::default().fg(Color::DarkGray)),
             Span::raw(format!("{} discovered", app.models.len())),
         ]),
         Line::from(vec![
-            Span::styled("profiles  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Profiles  ", Style::default().fg(Color::DarkGray)),
             Span::raw(format!("{} loaded", app.profiles.profiles.len())),
         ]),
     ];
     frame.render_widget(
-        Paragraph::new(server_lines).block(title("SERVER", "")),
+        Paragraph::new(server_lines).block(title("SERVER").padding(Padding::horizontal(1))),
         chunks[0],
     );
 
@@ -2822,7 +3673,10 @@ fn dashboard(frame: &mut ratatui::Frame, app: &App, area: Rect) {
                     Style::default().fg(Color::Cyan),
                 ),
                 Span::styled(" PP ", Style::default().fg(Color::DarkGray)),
-                Span::raw(format!("{:.1} tok/s", request.prompt_tok_s)),
+                Span::styled(
+                    format!("{:.1} tok/s", request.prompt_tok_s),
+                    Style::default().fg(Color::Yellow),
+                ),
                 Span::styled("   GEN ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     format!("{:.1} tok/s", request.generation_tok_s),
@@ -2841,8 +3695,8 @@ fn dashboard(frame: &mut ratatui::Frame, app: &App, area: Rect) {
                 Span::raw(
                     request
                         .ttft_ms
-                        .map(|value| format!("{value:.0}ms"))
-                        .unwrap_or_else(|| "—".into()),
+                        .map(|value| format!("{:.2}s", value / 1000.0))
+                        .unwrap_or_else(|| "--".into()),
                 ),
                 Span::styled("   TIME ", Style::default().fg(Color::DarkGray)),
                 Span::raw(format!("{:.2}s", request.duration_ms as f64 / 1000.0)),
@@ -2854,7 +3708,7 @@ fn dashboard(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     } else {
         chunks[2]
     };
-    let telemetry_block = title("TELEMETRY", "");
+    let telemetry_block = title("METRICS").padding(Padding::horizontal(1));
     let telemetry_inner = telemetry_block.inner(telemetry_area);
     frame.render_widget(telemetry_block, telemetry_area);
 
@@ -2889,7 +3743,7 @@ fn dashboard(frame: &mut ratatui::Frame, app: &App, area: Rect) {
             .split(telemetry_inner);
         for ((model, slots), group_rect) in groups.iter().zip(group_rects.iter()) {
             let mut header_spans = vec![Span::styled(
-                format!(" {model}"),
+                model.to_owned(),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -2958,7 +3812,7 @@ fn dashboard(frame: &mut ratatui::Frame, app: &App, area: Rect) {
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled("  TOK/S ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("  T/S ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
                         rate,
                         Style::default()
@@ -2966,7 +3820,7 @@ fn dashboard(frame: &mut ratatui::Frame, app: &App, area: Rect) {
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        format!("  {state}"),
+                        format!("  {state} "),
                         Style::default().fg(color).add_modifier(Modifier::BOLD),
                     ),
                 ]);
@@ -2979,11 +3833,14 @@ fn dashboard(frame: &mut ratatui::Frame, app: &App, area: Rect) {
                 .max()
                 .unwrap_or(0) as u16;
             let card_width = content_width.saturating_add(2);
-            for ((slot_id, line), rect) in lines.into_iter().zip(rects.iter()) {
+            let slot_count = lines.len();
+            for (index, ((slot_id, line), rect)) in lines.into_iter().zip(rects.iter()).enumerate()
+            {
                 frame.render_widget(
-                    Paragraph::new(line).block(compact_block(format!("SLOT {slot_id}"))),
+                    Paragraph::new(line).block(tree_slot_block(slot_id, index + 1 < slot_count)),
                     Rect {
-                        width: card_width.min(rect.width),
+                        x: rect.x + 1,
+                        width: card_width.min(rect.width.saturating_sub(1)),
                         ..*rect
                     },
                 );
@@ -3063,7 +3920,7 @@ fn model_page(frame: &mut ratatui::Frame, app: &App, area: Rect) {
             .add_modifier(Modifier::BOLD),
     )
     .highlight_symbol("› ")
-    .block(title("MODELS", ""));
+    .block(title("MODELS"));
     let mut state = ratatui::widgets::TableState::default().with_selected(Some(selected_row));
     frame.render_stateful_widget(table, area, &mut state);
 }
@@ -3071,32 +3928,57 @@ fn profile_editor_view(frame: &mut ratatui::Frame, app: &App, editor: &ProfileEd
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1),
             Constraint::Length(3),
-            Constraint::Length(1),
             Constraint::Min(1),
-            Constraint::Length(1),
         ])
         .split(area);
-    frame.render_widget(
-        Paragraph::new(vec![Line::from(vec![
-            Span::styled(
-                format!(" PROFILE EDITOR · {}", editor.name),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "   ↑/↓ select · ←/→ change · t exact · e flags · Enter save · Esc cancel",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])])
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Cyan)),
-        ),
-        layout[0],
+    let estimate_cards = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)])
+        .split(layout[1]);
+    let free_vram = app
+        .telemetry
+        .vram_total
+        .saturating_sub(app.telemetry.vram_used);
+    let free_ram = app
+        .telemetry
+        .ram_total
+        .saturating_sub(app.telemetry.ram_used);
+    let estimate = match &editor.estimate {
+        EstimateState::Pending => None,
+        EstimateState::Ready(estimate) => Some(estimate),
+    };
+    let vram_color = estimate.map_or(Color::DarkGray, |estimate| {
+        if free_vram > 0 && estimate.vram as f64 <= free_vram as f64 * 0.85 {
+            Color::Green
+        } else if free_vram > 0 && estimate.vram <= free_vram {
+            Color::Yellow
+        } else if free_vram > 0 {
+            Color::Red
+        } else {
+            Color::DarkGray
+        }
+    });
+    estimate_card(
+        frame,
+        estimate_cards[0],
+        "EST. VRAM",
+        estimate.map(|estimate| estimate.vram),
+        free_vram,
+        vram_color,
+    );
+    estimate_card(
+        frame,
+        estimate_cards[1],
+        "EST. RAM",
+        estimate.map(|estimate| estimate.ram),
+        free_ram,
+        if estimate.is_some() {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        },
     );
     let filename = editor
         .path
@@ -3104,9 +3986,15 @@ fn profile_editor_view(frame: &mut ratatui::Frame, app: &App, editor: &ProfileEd
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| editor.path.display().to_string());
     frame.render_widget(
-        Paragraph::new(format!(" Model: {} · {}", editor.owner, filename))
-            .style(Style::default().fg(Color::DarkGray)),
-        layout[1],
+        Paragraph::new(Line::from(vec![
+            Span::styled(" Profile ", Style::default().fg(Color::DarkGray)),
+            Span::raw(editor.name.clone()),
+            Span::styled(" · Model ", Style::default().fg(Color::DarkGray)),
+            Span::raw(editor.owner.clone()),
+            Span::styled(" · File ", Style::default().fg(Color::DarkGray)),
+            Span::raw(filename),
+        ])),
+        layout[0],
     );
     let mut items = Vec::new();
     for row in editor_rows(editor.advanced) {
@@ -3139,18 +4027,7 @@ fn profile_editor_view(frame: &mut ratatui::Frame, app: &App, editor: &ProfileEd
     let mut state = ListState::default().with_selected(Some(selected_item));
     frame.render_stateful_widget(
         List::new(items)
-            .block(
-                Block::default()
-                    .title(Span::styled(
-                        " SETTINGS ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ))
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::Cyan)),
-            )
+            .block(title("PROFILE EDITOR"))
             .highlight_style(
                 Style::default()
                     .fg(Color::Black)
@@ -3160,41 +4037,6 @@ fn profile_editor_view(frame: &mut ratatui::Frame, app: &App, editor: &ProfileEd
             .highlight_symbol("› "),
         layout[2],
         &mut state,
-    );
-    let gib = (1u64 << 30) as f64;
-    let free = (app
-        .telemetry
-        .vram_total
-        .saturating_sub(app.telemetry.vram_used)) as f64
-        / gib;
-    let (text, color) = match &editor.estimate {
-        EstimateState::Pending => (
-            " Estimated VRAM … · RAM …   (estimating)".to_owned(),
-            Color::DarkGray,
-        ),
-        EstimateState::Ready(estimate) => {
-            let vram = estimate.vram as f64 / gib;
-            let ram = estimate.ram as f64 / gib;
-            let color = if free > 0.0 && vram <= free * 0.85 {
-                Color::Green
-            } else if free > 0.0 && vram <= free {
-                Color::Yellow
-            } else if free > 0.0 {
-                Color::Red
-            } else {
-                Color::DarkGray
-            };
-            (
-                format!(
-                    " Estimated VRAM {vram:>6.2} G · RAM {ram:>6.2} G    (free VRAM {free:.0} G)"
-                ),
-                color,
-            )
-        }
-    };
-    frame.render_widget(
-        Paragraph::new(Span::styled(text, Style::default().fg(color))),
-        layout[3],
     );
 }
 
@@ -3208,6 +4050,7 @@ const EDITOR_BASIC_CATEGORIES: &[EditorCategory] = &[
         label: "PERFORMANCE",
         fields: &[
             EditorField::Ctx,
+            EditorField::ContextStep,
             EditorField::Parallel,
             EditorField::Batch,
             EditorField::Ubatch,
@@ -3335,6 +4178,7 @@ fn editor_selected_row(selected: usize, advanced: bool) -> usize {
 fn editor_field_label(field: EditorField) -> &'static str {
     match field {
         EditorField::Ctx => "Context size",
+        EditorField::ContextStep => "Context step",
         EditorField::Parallel => "Parallel slots",
         EditorField::Batch => "Prompt batch",
         EditorField::Ubatch => "Microbatch",
@@ -3354,7 +4198,7 @@ fn editor_field_label(field: EditorField) -> &'static str {
         EditorField::Extra => "Extra flags",
         EditorField::Assign => "Default profile for model",
         EditorField::Advanced => "Advanced options",
-        EditorField::Fit => "Fit (--fit)",
+        EditorField::Fit => "Fit",
         EditorField::FitTarget => "Fit target (MiB)",
         EditorField::LoadMode => "Load mode",
         EditorField::Mlock => "Keep model in memory",
@@ -3378,6 +4222,7 @@ fn editor_field_value(field: EditorField, settings: &EditorSettings) -> String {
     let onoff = |value: bool| if value { "on" } else { "off" }.to_owned();
     match field {
         EditorField::Ctx => settings.ctx.to_string(),
+        EditorField::ContextStep => settings.context_step.to_string(),
         EditorField::Parallel => settings.parallel.to_string(),
         EditorField::Batch => settings.batch.to_string(),
         EditorField::Ubatch => settings.ubatch.to_string(),
@@ -3545,6 +4390,7 @@ fn editor_settings_from_profile(profile: &serde_json::Map<String, Value>) -> Edi
     });
     let mut settings = EditorSettings {
         ctx: u("ctx-size", 4096),
+        context_step: 4096,
         parallel: u("parallel", 1),
         batch: u("batch-size", 2048),
         ubatch: u("ubatch-size", 512),
@@ -3787,6 +4633,8 @@ fn editor_profile_from_profile(
 }
 
 fn profile_page(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    let wide = area.width >= 140;
+    let show_memory = area.width >= 70;
     let gib = (1u64 << 30) as f64;
     let free_vram = (app
         .telemetry
@@ -3810,15 +4658,10 @@ fn profile_page(frame: &mut ratatui::Frame, app: &App, area: Rect) {
                 .get(name)
                 .copied()
                 .or_else(|| owner.and_then(|owner| app.last_tok.get(owner)).copied());
-            let mut name_spans = vec![Span::styled(
-                if pinned { "◆ " } else { "  " },
-                Style::default().fg(if pinned {
-                    Color::Yellow
-                } else {
-                    Color::DarkGray
-                }),
-            )];
-            name_spans.push(Span::raw(name.clone()));
+            let mut name_spans = vec![Span::raw(format!(" {name}"))];
+            if pinned {
+                name_spans.push(Span::styled(" ◆", Style::default().fg(Color::Yellow)));
+            }
             if is_default {
                 name_spans.push(Span::styled(" ★", Style::default().fg(Color::Cyan)));
             }
@@ -3832,85 +4675,254 @@ fn profile_page(frame: &mut ratatui::Frame, app: &App, area: Rect) {
                 Color::Red
             };
             let (tok_text, tok_color) = match rate {
-                Some(rate) if rate > 0.0 => (format!("{rate:>5.1}"), Color::Green),
-                _ => ("—".into(), Color::DarkGray),
+                Some(rate) if rate > 0.0 => (format!("{rate:.1}"), Color::Green),
+                _ => ("--".into(), Color::DarkGray),
             };
-            Row::new(vec![
-                Line::from(name_spans),
-                Line::from(Span::styled(
+            let latest = app
+                .benchmarks
+                .profiles
+                .get(name)
+                .and_then(|runs| runs.last());
+            let benchmark_decode = latest.and_then(benchmark_decode_median);
+            let mut cells = vec![Line::from(name_spans)];
+            if show_memory {
+                cells.push(Line::from(Span::styled(
                     estimate
-                        .map(|_| format!("{vram:>5.1}G"))
-                        .unwrap_or_else(|| "   …  ".into()),
+                        .map(|_| format!("{vram:.1}G"))
+                        .unwrap_or_else(|| "…".into()),
                     Style::default().fg(vram_color),
-                )),
-                Line::raw(
+                )));
+                cells.push(Line::from(Span::styled(
                     estimate
-                        .map(|_| format!("{ram:>5.1}G"))
-                        .unwrap_or_else(|| "   …  ".into()),
-                ),
-                Line::from(Span::styled(tok_text, Style::default().fg(tok_color))),
-            ])
+                        .map(|_| format!("{ram:.1}G"))
+                        .unwrap_or_else(|| "…".into()),
+                    Style::default().fg(if estimate.is_some() {
+                        Color::White
+                    } else {
+                        Color::DarkGray
+                    }),
+                )));
+            }
+            if wide {
+                let context = app
+                    .profiles
+                    .profiles
+                    .get(name)
+                    .and_then(|profile| profile.get("ctx-size"))
+                    .and_then(|value| {
+                        value
+                            .as_u64()
+                            .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+                    })
+                    .unwrap_or(app.cfg.ctx_size);
+                cells.push(Line::raw(context.to_string()));
+                for case_name in ["small", "medium", "long"] {
+                    let case =
+                        latest.and_then(|run| run.cases.iter().find(|case| case.name == case_name));
+                    cells.push(benchmark_metric_cell(
+                        case.map(|case| case.prompt_tokens_per_second),
+                        Color::Yellow,
+                    ));
+                    cells.push(benchmark_metric_cell(
+                        case.map(|case| case.decode_median_tokens_per_second),
+                        Color::Green,
+                    ));
+                }
+            } else {
+                cells.push(benchmark_metric_cell(benchmark_decode, Color::Green));
+            }
+            cells.push(Line::from(Span::styled(
+                tok_text,
+                Style::default().fg(tok_color),
+            )));
+            Row::new(cells)
         })
         .collect::<Vec<_>>();
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Min(30),
-            Constraint::Length(8),
-            Constraint::Length(8),
-            Constraint::Length(9),
-        ],
-    )
-    .header(
-        Row::new(["", "VRAM", "RAM", "TOK/S"]).style(
+    let (headers, widths) = if wide {
+        (
+            vec![
+                "PROFILE", "VRAM", "RAM", "CTX", "PP-S", "T/S-S", "PP-M", "T/S-M", "PP-L", "T/S-L",
+                "LIVE T/S",
+            ],
+            vec![
+                Constraint::Percentage(30),
+                Constraint::Length(8),
+                Constraint::Length(8),
+                Constraint::Length(9),
+                Constraint::Length(7),
+                Constraint::Length(7),
+                Constraint::Length(7),
+                Constraint::Length(7),
+                Constraint::Length(7),
+                Constraint::Length(7),
+                Constraint::Length(11),
+            ],
+        )
+    } else if show_memory {
+        (
+            vec!["PROFILE", "VRAM", "RAM", "BENCH T/S", "LIVE T/S"],
+            vec![
+                Constraint::Percentage(30),
+                Constraint::Length(8),
+                Constraint::Length(8),
+                Constraint::Length(10),
+                Constraint::Length(11),
+            ],
+        )
+    } else {
+        (
+            vec!["PROFILE", "BENCH T/S", "LIVE T/S"],
+            vec![
+                Constraint::Percentage(50),
+                Constraint::Length(10),
+                Constraint::Length(11),
+            ],
+        )
+    };
+    let table = Table::new(rows, widths)
+        .header(
+            Row::new(headers).style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        )
+        .row_highlight_style(
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Black)
+                .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
-        ),
-    )
-    .row_highlight_style(
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )
-    .highlight_symbol("› ")
-    .block(title("PROFILES", ""));
+        )
+        .highlight_symbol("› ")
+        .block(title("PROFILES"));
     let mut state = ratatui::widgets::TableState::default().with_selected(Some(app.selected));
     frame.render_stateful_widget(table, area, &mut state);
 }
-fn settings_page(frame: &mut ratatui::Frame, app: &App, area: Rect) {
-    let items = settings(&app.cfg)
-        .into_iter()
-        .map(|(k, v)| ListItem::new(format!("{k:<26} {v}")))
+fn benchmark_decode_median(run: &benchmark::BenchmarkRun) -> Option<f64> {
+    let mut values = run
+        .cases
+        .iter()
+        .map(|case| case.decode_median_tokens_per_second)
+        .filter(|value| *value > 0.0)
         .collect::<Vec<_>>();
-    let mut state = ListState::default().with_selected(Some(app.selected));
-    frame.render_stateful_widget(
-        List::new(items)
-            .block(title("SETTINGS", ""))
-            .highlight_style(
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("› "),
-        area,
-        &mut state,
-    );
+    values.sort_by(f64::total_cmp);
+    match values.len() {
+        0 => None,
+        count if count % 2 == 1 => Some(values[count / 2]),
+        count => Some((values[count / 2 - 1] + values[count / 2]) / 2.0),
+    }
+}
+fn benchmark_metric_cell(value: Option<f64>, color: Color) -> Line<'static> {
+    match value {
+        Some(value) => Line::from(Span::styled(
+            format!("{value:.1}"),
+            Style::default().fg(color),
+        )),
+        None => Line::from(Span::styled("--", Style::default().fg(Color::DarkGray))),
+    }
+}
+fn settings_page(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    let block = title("SETTINGS");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let rows = settings(&app.cfg);
+    let offset = app
+        .selected
+        .saturating_add(1)
+        .saturating_sub(inner.height as usize);
+    for (visible_index, (label, value)) in rows
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(inner.height as usize)
+    {
+        let row = Rect {
+            y: inner.y + (visible_index - offset) as u16,
+            height: 1,
+            ..inner
+        };
+        let selected = visible_index == app.selected;
+        let row_style = if selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        frame.render_widget(Block::default().style(row_style), row);
+        match value {
+            SettingValue::Text(value) => frame.render_widget(
+                Paragraph::new(format!("  {label:<26} {value}")).style(row_style),
+                row,
+            ),
+            SettingValue::Boolean { checked, detail } => {
+                let indicator_style = if selected {
+                    row_style
+                } else if *checked {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                frame.render_widget(
+                    Paragraph::new(format!("  {label:<26} ")).style(row_style),
+                    row,
+                );
+                let indicator_x = (row.x + 29).min(row.right());
+                frame.render_widget(
+                    Checkbox::new("", *checked)
+                        .checked_symbol("●")
+                        .unchecked_symbol("○")
+                        .style(row_style)
+                        .checkbox_style(indicator_style),
+                    Rect {
+                        x: indicator_x,
+                        width: row.right().saturating_sub(indicator_x).min(2),
+                        ..row
+                    },
+                );
+                if !detail.is_empty() {
+                    let detail_x = (indicator_x + 2).min(row.right());
+                    frame.render_widget(
+                        Paragraph::new(detail.clone()).style(row_style),
+                        Rect {
+                            x: detail_x,
+                            width: row.right().saturating_sub(detail_x),
+                            ..row
+                        },
+                    );
+                }
+            }
+        }
+    }
 }
 fn logs(frame: &mut ratatui::Frame, app: &App, area: Rect) {
-    let lines = app
-        .log
-        .lines()
-        .map(|line| Line::from(Span::styled(line.to_owned(), log_line_style(line))))
-        .collect::<Vec<_>>();
+    let lines = app.log.lines().map(log_line).collect::<Vec<_>>();
     frame.render_widget(
         Paragraph::new(lines)
-            .block(title("LOGS", ""))
+            .block(title("LOGS"))
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+fn log_line(line: &str) -> Line<'static> {
+    let Some((timestamp, message)) = line.split_once(' ').filter(|(timestamp, _)| {
+        let parts = timestamp.split('.').collect::<Vec<_>>();
+        parts.len() == 4
+            && parts
+                .iter()
+                .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
+    }) else {
+        return Line::from(Span::styled(line.to_owned(), log_line_style(line)));
+    };
+    Line::from(vec![
+        Span::styled(
+            format!("[{timestamp}] "),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(message.to_owned(), log_line_style(line)),
+    ])
 }
 fn log_line_style(line: &str) -> Style {
     let lower = line.to_ascii_lowercase();
@@ -3977,7 +4989,7 @@ fn system(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let mut state = ListState::default().with_selected(Some(app.selected));
     frame.render_stateful_widget(
         List::new(values.iter().map(|value| ListItem::new(value.as_str())))
-            .block(title("MAINTENANCE", ""))
+            .block(title("MAINTENANCE"))
             .highlight_style(
                 Style::default()
                     .fg(Color::Black)
@@ -3998,70 +5010,116 @@ fn service_installed() -> bool {
         })
         .unwrap_or(false)
 }
-fn settings(c: &Config) -> Vec<(String, String)> {
+fn available_runtimes(paths: &Paths, configured: &str) -> Vec<String> {
+    let mut runtimes = vec!["managed".to_owned()];
+    if let Ok(entries) = fs::read_dir(&paths.versions) {
+        let mut managed = entries
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().join("llama-server").is_file())
+            .map(|entry| format!("managed:{}", entry.file_name().to_string_lossy()))
+            .collect::<Vec<_>>();
+        managed.sort();
+        runtimes.extend(managed);
+    }
+    if let Some(home) = directories::BaseDirs::new().map(|base| base.home_dir().to_owned()) {
+        let backends = home.join(".lmstudio/extensions/backends");
+        if let Ok(entries) = fs::read_dir(backends) {
+            let mut lmstudio = entries
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    let path = entry.path();
+                    path.join("llama-server").is_file()
+                        && path.join("backend-manifest.json").is_file()
+                        && entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with("llama.cpp-")
+                })
+                .map(|entry| format!("lmstudio:{}", entry.file_name().to_string_lossy()))
+                .collect::<Vec<_>>();
+            lmstudio.sort();
+            runtimes.extend(lmstudio);
+        }
+    }
+    if !runtimes.iter().any(|runtime| runtime == configured) {
+        runtimes.push(configured.to_owned());
+    }
+    runtimes
+}
+enum SettingValue {
+    Text(String),
+    Boolean { checked: bool, detail: String },
+}
+
+fn context_step(c: &Config) -> u64 {
+    (4096.0 * c.context_step_scale)
+        .round()
+        .clamp(1024.0, 65_536.0) as u64
+}
+
+fn settings(c: &Config) -> Vec<(String, SettingValue)> {
     vec![
         (
             "LAN access".into(),
-            if c.host == "127.0.0.1" {
-                "Off — localhost only".into()
-            } else {
-                format!("On — {}", lan_ip())
+            SettingValue::Boolean {
+                checked: c.host != "127.0.0.1",
+                detail: if c.host == "127.0.0.1" {
+                    "localhost only".into()
+                } else {
+                    format!("- {}", lan_ip())
+                },
             },
         ),
-        ("API port".into(), c.port.to_string()),
+        ("API port".into(), SettingValue::Text(c.port.to_string())),
         (
             "Telemetry sidecar port".into(),
-            c.telemetry_port.to_string(),
+            SettingValue::Text(c.telemetry_port.to_string()),
         ),
-        ("Target".into(), c.backend.clone()),
-        ("Context size".into(), c.ctx_size.to_string()),
+        ("Runtime".into(), SettingValue::Text(c.runtime.clone())),
+        ("Target".into(), SettingValue::Text(c.backend.clone())),
+        (
+            "Context size".into(),
+            SettingValue::Text(c.ctx_size.to_string()),
+        ),
         (
             "Scheduler".into(),
-            if c.scheduler_enabled {
-                "enabled"
-            } else {
-                "disabled"
-            }
-            .into(),
+            SettingValue::Boolean {
+                checked: c.scheduler_enabled,
+                detail: String::new(),
+            },
         ),
         (
             "Scheduler VRAM fraction".into(),
-            format!("{:.0}%", c.scheduler_vram_fraction * 100.0),
+            SettingValue::Text(format!("{:.0}%", c.scheduler_vram_fraction * 100.0)),
         ),
         (
             "Pinned models".into(),
-            if c.scheduler_pinned_models.is_empty() {
+            SettingValue::Text(if c.scheduler_pinned_models.is_empty() {
                 "—".into()
             } else {
                 c.scheduler_pinned_models.join(", ")
-            },
+            }),
         ),
         (
             "Advertise base models".into(),
-            if c.advertise_base_models {
-                "enabled"
-            } else {
-                "disabled"
-            }
-            .into(),
+            SettingValue::Boolean {
+                checked: c.advertise_base_models,
+                detail: String::new(),
+            },
         ),
         (
             "Advertise profiles".into(),
-            if c.advertise_profiles {
-                "enabled"
-            } else {
-                "disabled"
-            }
-            .into(),
+            SettingValue::Boolean {
+                checked: c.advertise_profiles,
+                detail: String::new(),
+            },
         ),
         (
             "Start on boot".into(),
-            if crate::service_enabled() {
-                "enabled"
-            } else {
-                "disabled"
-            }
-            .into(),
+            SettingValue::Boolean {
+                checked: crate::service_enabled(),
+                detail: String::new(),
+            },
         ),
     ]
 }
@@ -4175,7 +5233,7 @@ fn vram_capacity_bytes() -> u64 {
     })
 }
 
-fn system_telemetry(cfg: &Config) -> Telemetry {
+fn system_telemetry(cfg: &Config, probe_api: bool) -> Telemetry {
     let text = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let mem = |name: &str| {
         text.lines()
@@ -4192,9 +5250,10 @@ fn system_telemetry(cfg: &Config) -> Telemetry {
         ram_total,
         ..Telemetry::default()
     };
-    if let Ok(client) = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_millis(500))
-        .build()
+    if probe_api
+        && let Ok(client) = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(500))
+            .build()
     {
         let api_key = cfg.keys().into_iter().next();
         let endpoints = [

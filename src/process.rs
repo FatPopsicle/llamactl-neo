@@ -36,7 +36,7 @@ pub fn pid(paths: &Paths) -> Option<u32> {
     Some(value)
 }
 
-fn runtime_command(binary: &Path, paths: &Paths) -> Command {
+pub(crate) fn runtime_command(binary: &Path, paths: &Paths) -> Command {
     // A runtime that needs an environment script cannot simply be exec'd. Wrap
     // it in a shell that sources the script first, then execs the binary so no
     // extra process is left in the tree and signals/exit codes pass through
@@ -254,11 +254,31 @@ pub fn serve(
     model: Option<&str>,
     extra: &[String],
 ) -> Result<()> {
-    let (binary, args, _) = build_command(cfg, paths, profiles, model, extra)?;
-    let status = runtime_command(&binary, paths)
+    if let Some(existing) = pid(paths) {
+        bail!("server already running (pid {existing})")
+    }
+    fs::create_dir_all(&paths.state_dir)?;
+    let (binary, args, swap) = build_command(cfg, paths, profiles, model, extra)?;
+    let mut child = runtime_command(&binary, paths)
         .args(&args)
-        .status()
+        .process_group(0)
+        .spawn()
         .with_context(|| format!("run {}", binary.display()))?;
+    let child_id = child.id();
+    fs::write(&paths.pid, format!("{child_id}\n"))?;
+    crate::config::atomic_json(
+        &paths.launch,
+        &LaunchSpec {
+            model: model.map(str::to_owned),
+            extra: extra.to_owned(),
+            swap,
+        },
+    )?;
+
+    let status = child.wait()?;
+    if pid(paths) == Some(child_id) {
+        let _ = fs::remove_file(&paths.pid);
+    }
     if !status.success() {
         bail!("server exited with {status}")
     }
@@ -310,6 +330,24 @@ pub fn start(
     Ok(child.id())
 }
 pub fn stop(paths: &Paths) -> Result<bool> {
+    // A server launched by the user service must be stopped through systemd.
+    // Killing only its child makes Restart=on-failure immediately bring it back.
+    let service_active = Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", "llamactl.service"])
+        .status()
+        .is_ok_and(|status| status.success());
+    if service_active {
+        let status = Command::new("systemctl")
+            .args(["--user", "stop", "llamactl.service"])
+            .status()
+            .context("stop llamactl user service")?;
+        if !status.success() {
+            bail!("systemctl --user stop llamactl.service failed with {status}")
+        }
+        let _ = fs::remove_file(&paths.pid);
+        return Ok(true);
+    }
+
     let Some(id) = pid(paths) else {
         let _ = fs::remove_file(&paths.pid);
         return Ok(false);
@@ -1073,7 +1111,10 @@ mod capacity_live {
     #[ignore]
     fn reports_installed_vram() {
         let bytes = super::installed_vram_bytes();
-        println!("device_memory_bytes: {:?}", super::device_memory_bytes().map(|(t,f)| (t >> 30, f >> 30)));
+        println!(
+            "device_memory_bytes: {:?}",
+            super::device_memory_bytes().map(|(t, f)| (t >> 30, f >> 30))
+        );
         println!(
             "installed_vram_bytes: {} bytes = {:.2} GiB",
             bytes,

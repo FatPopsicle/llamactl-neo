@@ -853,6 +853,8 @@ dependencies = [
  "sha2",
  "tar",
  "tempfile",
+ "throbber-widgets-tui",
+ "tui-checkbox",
  "walkdir",
 ]
 
@@ -1570,6 +1572,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "throbber-widgets-tui"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45e58887883fb0a259717b16d68d251983e40850b4b2f45c2da410f46d4333dc"
+dependencies = [
+ "ratatui",
+]
+
+[[package]]
 name = "tinystr"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1687,6 +1698,15 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
+name = "tui-checkbox"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59ed12253db0c5d95c43d9cc9904cc391c5034195573ef64e1f5633904a27127"
+dependencies = [
+ "ratatui",
+]
 
 [[package]]
 name = "typenum"

@@ -145,7 +145,9 @@ pub fn read() -> DrmMemory {
 
     for entry in procs.flatten() {
         let name = entry.file_name();
-        let Some(pid_str) = name.to_str() else { continue };
+        let Some(pid_str) = name.to_str() else {
+            continue;
+        };
         let Ok(pid) = pid_str.parse::<i32>() else {
             continue;
         };
@@ -162,8 +164,7 @@ pub fn read() -> DrmMemory {
             let Some(fields) = read_fdinfo(&fd.path()) else {
                 continue;
             };
-            let (Some(pdev), Some(cid)) =
-                (fields.get("drm-pdev"), fields.get("drm-client-id"))
+            let (Some(pdev), Some(cid)) = (fields.get("drm-pdev"), fields.get("drm-client-id"))
             else {
                 continue;
             };
@@ -321,7 +322,10 @@ mod live {
             mem.total_allocated() as f64 / (1 << 30) as f64,
             mem.total_resident() as f64 / (1 << 30) as f64
         );
-        println!("capacity from sysfs: {} bytes (0 = driver publishes none)", device_total_bytes());
+        println!(
+            "capacity from sysfs: {} bytes (0 = driver publishes none)",
+            device_total_bytes()
+        );
         println!("temps: {:?}", temperatures());
     }
 }

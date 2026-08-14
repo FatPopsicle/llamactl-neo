@@ -1,3 +1,4 @@
+mod benchmark;
 mod config;
 mod drm;
 mod models;
@@ -113,6 +114,8 @@ enum ProfileAction {
     Clone { source: String, new_name: String },
     Rename { source: String, new_name: String },
     Delete { name: String },
+    Benchmark { name: String },
+    Benchmarks { name: String },
 }
 
 fn main() {
@@ -376,29 +379,59 @@ fn list_builds(p: &Paths) -> Result<()> {
     Ok(())
 }
 fn profile_command(c: &Config, p: &Paths, a: Option<ProfileAction>) -> Result<()> {
-    let mut d = Profiles::load(p)?;
-    let changed = a.is_some();
+    let mut profiles = Profiles::load(p)?;
+    let mut refresh = false;
     match a {
         None => {
             println!("  {:<30} OWNER", "PROFILE");
-            for n in d.profiles.keys() {
-                println!("  {:<30} {}", n, d.owner(n).unwrap_or("unassigned"))
+            for name in profiles.profiles.keys() {
+                println!(
+                    "  {:<30} {}",
+                    name,
+                    profiles.owner(name).unwrap_or("unassigned")
+                )
             }
         }
         Some(ProfileAction::Clone { source, new_name }) => {
-            d.clone_profile(&source, &new_name)?;
-            d.save(p)?
+            profiles.clone_profile(&source, &new_name)?;
+            profiles.save(p)?;
+            refresh = true;
         }
         Some(ProfileAction::Rename { source, new_name }) => {
-            d.rename(&source, &new_name)?;
-            d.save(p)?
+            profiles.rename(&source, &new_name)?;
+            profiles.save(p)?;
+            let mut benchmarks = benchmark::ProfileBenchmarks::load(p)?;
+            benchmarks.rename(&source, &new_name);
+            benchmarks.save(p)?;
+            refresh = true;
         }
         Some(ProfileAction::Delete { name }) => {
-            d.remove(&name)?;
-            d.save(p)?
+            profiles.remove(&name)?;
+            profiles.save(p)?;
+            let mut benchmarks = benchmark::ProfileBenchmarks::load(p)?;
+            benchmarks.remove(&name);
+            benchmarks.save(p)?;
+            refresh = true;
+        }
+        Some(ProfileAction::Benchmark { name }) => {
+            let run = benchmark::run(c, p, &profiles, &name)?;
+            println!("{}", benchmark::summary(&run));
+        }
+        Some(ProfileAction::Benchmarks { name }) => {
+            let benchmarks = benchmark::ProfileBenchmarks::load(p)?;
+            let runs = benchmarks
+                .profiles
+                .get(&name)
+                .with_context(|| format!("profile '{name}' has no benchmark results"))?;
+            for (index, run) in runs.iter().rev().enumerate() {
+                if index > 0 {
+                    println!();
+                }
+                println!("{}", benchmark::summary(run));
+            }
         }
     }
-    if changed {
+    if refresh {
         refresh_swap(c, p)?;
     }
     Ok(())
