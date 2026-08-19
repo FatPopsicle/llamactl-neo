@@ -354,7 +354,9 @@ fn run_inner(
         let mut next = 0usize;
 
         // Prefill-only: prompt processing throughput, no generation.
-        for (name, fraction) in PREFILL_CASES.into_iter() {
+        // Short and medium run first so they land in the "medium" prefix;
+        // the slow long prefill is deferred to after the single-stream tiers.
+        for (name, fraction) in [PREFILL_CASES[0], PREFILL_CASES[1]] {
             if next >= max_cases {
                 break;
             }
@@ -387,46 +389,29 @@ fn run_inner(
             next += 1;
         }
 
-        // Coding tier: single-stream, then maximum-resident-slot throughput.
-        for (name, concurrency) in [("coding-single", 1u64), ("coding-slots", slots)] {
-            if next >= max_cases {
-                break;
-            }
+        // Coding tier: single-stream first.
+        if next < max_cases {
             if cancelled.load(Ordering::Relaxed) {
                 bail!("benchmark cancelled")
             }
             emit(
                 &progress,
                 BenchmarkProgress::CaseStarted {
-                    name: name.to_owned(),
+                    name: "coding-single".to_owned(),
                     target_prompt_tokens: 0,
                     started_at: Instant::now(),
                 },
             );
-            let case = if concurrency == 1 {
-                run_generation(
-                    &client,
-                    &base,
-                    name,
-                    "coding",
-                    CODING_PROMPT.to_owned(),
-                    CODING_TOKENS,
-                    child_id,
-                )?
-                .0
-            } else {
-                run_generation_multi(
-                    &client,
-                    &base,
-                    name,
-                    "coding",
-                    vec![CODING_PROMPT.to_owned(); concurrency as usize],
-                    CODING_TOKENS,
-                    concurrency,
-                    child_id,
-                )?
-                .0
-            };
+            let case = run_generation(
+                &client,
+                &base,
+                "coding-single",
+                "coding",
+                CODING_PROMPT.to_owned(),
+                CODING_TOKENS,
+                child_id,
+            )?
+            .0;
             emit(&progress, BenchmarkProgress::CaseCompleted(case.clone()));
             partial_run
                 .as_mut()
@@ -471,6 +456,102 @@ fn run_inner(
             next += 1;
         }
 
+        if next < max_cases {
+            if cancelled.load(Ordering::Relaxed) {
+                bail!("benchmark cancelled")
+            }
+            let zh_prompt = format!("{PROSE_ZH_PREFIX}{story_single}");
+            emit(
+                &progress,
+                BenchmarkProgress::CaseStarted {
+                    name: "prose-zh-single".to_owned(),
+                    target_prompt_tokens: 0,
+                    started_at: Instant::now(),
+                },
+            );
+            let (case, _) = run_generation(
+                &client,
+                &base,
+                "prose-zh-single",
+                "prose",
+                zh_prompt,
+                PROSE_TOKENS,
+                child_id,
+            )?;
+            emit(&progress, BenchmarkProgress::CaseCompleted(case.clone()));
+            partial_run
+                .as_mut()
+                .expect("benchmark run metadata initialized")
+                .cases
+                .push(case);
+            next += 1;
+        }
+
+        // Long prefill: kept out of the "medium" prefix because it is slow.
+        if next < max_cases {
+            if cancelled.load(Ordering::Relaxed) {
+                bail!("benchmark cancelled")
+            }
+            let (name, fraction) = PREFILL_CASES[2];
+            let target =
+                ((effective_context as f64 * fraction).round() as u64).clamp(32, available);
+            let mut case_seed = seed_tokens.clone();
+            if !case_seed.is_empty() {
+                let length = case_seed.len();
+                case_seed.rotate_left((next * 7) % length);
+            }
+            let prompt = repeated_prompt(&case_seed, target as usize);
+            emit(
+                &progress,
+                BenchmarkProgress::CaseStarted {
+                    name: name.to_owned(),
+                    target_prompt_tokens: target,
+                    started_at: Instant::now(),
+                },
+            );
+            let case = run_prefill(&client, &base, name, target, prompt, child_id)?;
+            emit(&progress, BenchmarkProgress::CaseCompleted(case.clone()));
+            partial_run
+                .as_mut()
+                .expect("benchmark run metadata initialized")
+                .cases
+                .push(case);
+            next += 1;
+        }
+
+        // Maximum-resident-slot throughput for both tiers.
+        if next < max_cases && slots > 1 {
+            if cancelled.load(Ordering::Relaxed) {
+                bail!("benchmark cancelled")
+            }
+            emit(
+                &progress,
+                BenchmarkProgress::CaseStarted {
+                    name: "coding-slots".to_owned(),
+                    target_prompt_tokens: 0,
+                    started_at: Instant::now(),
+                },
+            );
+            let case = run_generation_multi(
+                &client,
+                &base,
+                "coding-slots",
+                "coding",
+                vec![CODING_PROMPT.to_owned(); slots as usize],
+                CODING_TOKENS,
+                slots,
+                child_id,
+            )?
+            .0;
+            emit(&progress, BenchmarkProgress::CaseCompleted(case.clone()));
+            partial_run
+                .as_mut()
+                .expect("benchmark run metadata initialized")
+                .cases
+                .push(case);
+            next += 1;
+        }
+
         if next < max_cases && slots > 1 {
             if cancelled.load(Ordering::Relaxed) {
                 bail!("benchmark cancelled")
@@ -494,37 +575,6 @@ fn run_inner(
                 child_id,
             )?;
             stories_slots = stories;
-            emit(&progress, BenchmarkProgress::CaseCompleted(case.clone()));
-            partial_run
-                .as_mut()
-                .expect("benchmark run metadata initialized")
-                .cases
-                .push(case);
-            next += 1;
-        }
-
-        if next < max_cases {
-            if cancelled.load(Ordering::Relaxed) {
-                bail!("benchmark cancelled")
-            }
-            let zh_prompt = format!("{PROSE_ZH_PREFIX}{story_single}");
-            emit(
-                &progress,
-                BenchmarkProgress::CaseStarted {
-                    name: "prose-zh-single".to_owned(),
-                    target_prompt_tokens: 0,
-                    started_at: Instant::now(),
-                },
-            );
-            let (case, _) = run_generation(
-                &client,
-                &base,
-                "prose-zh-single",
-                "prose",
-                zh_prompt,
-                PROSE_TOKENS,
-                child_id,
-            )?;
             emit(&progress, BenchmarkProgress::CaseCompleted(case.clone()));
             partial_run
                 .as_mut()

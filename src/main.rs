@@ -611,10 +611,9 @@ fn profile_command(c: &Config, p: &Paths, a: Option<ProfileAction>) -> Result<()
         }
         Some(ProfileAction::Benchmark { name, max_case }) => {
             let max_cases = match max_case.as_deref() {
-                None | Some("all") => benchmark::TOTAL_CASES,
+                None | Some("long") | Some("all") => benchmark::TOTAL_CASES,
                 Some("small") => 1,
-                Some("medium") => 2,
-                Some("long") => benchmark::PREFILL_CASES.len(),
+                Some("medium") => 5,
                 Some(other) => bail!("unknown case '{other}' - use small, medium, long, or all"),
             };
             let cancelled = Arc::new(AtomicBool::new(false));
