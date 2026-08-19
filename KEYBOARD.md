@@ -10,7 +10,7 @@ llamactl NEO uses the same navigation and confirmation rules throughout the TUI.
 | `Home` / `End` | Select the first or last item |
 | `Left` / `Right`, `h` / `l` | Switch workspace |
 | `Tab` / `Shift+Tab` | Switch workspace forward or backward |
-| `1`–`7` | Jump to Dashboard, Models, Profiles, Settings, Logs, Maintenance, or Downloads |
+| `1`–`8` | Jump to Dashboard, Models, Profiles, Templates, Search, Settings, Logs, or Maintenance |
 | `Enter` | Run the selected workspace's primary action |
 | `r` | Refresh application state |
 | `?` | Open or close the in-app control reference |
@@ -34,6 +34,7 @@ Navigation keys are contextual inside editors and modals. For example, arrow key
 | `Enter` | Load or start the selected model |
 | `c` | Create a profile for the selected model |
 | `u` | Unload the selected model from the scheduler |
+| `d` | Delete the selected model after confirmation |
 
 ### Profiles
 

@@ -1,6 +1,7 @@
 mod benchmark;
 mod config;
 mod drm;
+mod gguf;
 mod huggingface;
 mod models;
 mod process;
@@ -18,7 +19,7 @@ use std::{
     io::{IsTerminal, Read},
     path::PathBuf,
     process::Command,
-    sync::LazyLock,
+    sync::{Arc, LazyLock, atomic::{AtomicBool, Ordering}},
 };
 
 #[derive(Parser)]
@@ -71,6 +72,15 @@ enum Commands {
         model: String,
         #[arg(short, long)]
         yes: bool,
+    },
+
+    Graft {
+        target: String,
+        donor: String,
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        profile: Option<String>,
     },
     Stop,
     Restart,
@@ -157,7 +167,11 @@ enum ProfileAction {
     Clone { source: String, new_name: String },
     Rename { source: String, new_name: String },
     Delete { name: String },
-    Benchmark { name: String },
+    Benchmark {
+        name: String,
+        #[arg(long, value_name = "CASE")]
+        max_case: Option<String>,
+    },
     Benchmarks { name: String },
     Create {
         name: String,
@@ -170,6 +184,10 @@ enum ProfileAction {
         name: String,
         key: String,
         value: String,
+    },
+    SetModel {
+        name: String,
+        model: String,
     },
 }
 #[derive(Subcommand)]
@@ -319,6 +337,61 @@ fn run() -> Result<()> {
                 removed.len()
             )
         }
+        Some(Commands::Graft {
+            target,
+            donor,
+            output,
+            profile,
+        }) => {
+            let (_, target_path, _) = models::resolve(&cfg, Some(&target))?;
+            let target_path = target_path.context("target is not a local model")?;
+            let (_, donor_path, _) = models::resolve(&cfg, Some(&donor))?;
+            let donor_path = donor_path.context("donor is not a local model")?;
+            let output = output.unwrap_or_else(|| {
+                let stem = target_path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                let mut out = target_path.clone();
+                out.set_file_name(format!("{stem}-MTP.gguf"));
+                out
+            });
+            println!(
+                "grafting MTP from {} into {}…",
+                donor_path.display(),
+                target_path.display()
+            );
+            let mut last_tenth = u64::MAX;
+            let report = gguf::graft_mtp(&target_path, &donor_path, &output, |copied, total| {
+                if total > 0 {
+                    let tenth = copied * 10 / total;
+                    if tenth != last_tenth {
+                        eprintln!("  {}%", tenth * 10);
+                        last_tenth = tenth;
+                    }
+                }
+            })?;
+            println!(
+                "✓ grafted {} MTP tensor(s) into {} ({} tensors, {} blocks, nextn {}, {:.2} GiB)",
+                report.grafted_tensors,
+                output.display(),
+                report.total_tensors,
+                report.block_count,
+                report.nextn_layers,
+                report.output_bytes as f64 / (1u64 << 30) as f64
+            );
+            if let Some(name) = profile {
+                let mut profiles = Profiles::load(&paths)?;
+                let query = output.to_string_lossy().into_owned();
+                let (id, _, removed_mtp) = retarget_profile(&cfg, &mut profiles, &name, &query)?;
+                profiles.save(&paths)?;
+                refresh_swap(&cfg, &paths)?;
+                println!("✓ profile {name} now uses model {id}");
+                if removed_mtp {
+                    println!("⚠ removed draft-mtp speculation - model '{id}' lacks MTP tensors");
+                }
+            }
+        }
         Some(Commands::Config { key, value }) => match (key, value) {
             (None, None) => println!("{}", serde_json::to_string_pretty(&cfg)?),
             (Some(k), None) => {
@@ -459,6 +532,48 @@ fn list_builds(p: &Paths) -> Result<()> {
     }
     Ok(())
 }
+fn retarget_profile(
+    c: &Config,
+    profiles: &mut Profiles,
+    name: &str,
+    model: &str,
+) -> Result<(String, Option<String>, bool)> {
+    let (_, path, id) = models::resolve(c, Some(model))?;
+    let path = path.with_context(|| format!("model '{model}' is not a local model file"))?;
+    let (old_owner, removed_mtp) = {
+        let profile = profiles
+            .profiles
+            .get_mut(name)
+            .with_context(|| format!("unknown profile '{name}'"))?;
+        let old = profile
+            .get("_model")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        profile.insert("_model".into(), serde_json::Value::String(id.clone()));
+        // Internal MTP speculation only works when the target GGUF carries
+        // NextN tensors. Drop it rather than leave the profile unloadable.
+        let mut removed_mtp = false;
+        if profile.get("spec-type").and_then(serde_json::Value::as_str) == Some("draft-mtp")
+            && !profile.contains_key("spec-draft-model")
+            && !models::has_mtp(&path)
+        {
+            profile.remove("spec-type");
+            profile.remove("spec-draft-n-max");
+            removed_mtp = true;
+        }
+        (old, removed_mtp)
+    };
+    if let Some(old) = &old_owner
+        && profiles.models.get(old).and_then(serde_json::Value::as_str) == Some(name)
+    {
+        profiles.models.remove(old);
+    }
+    profiles
+        .models
+        .insert(id.clone(), serde_json::Value::String(name.to_owned()));
+    Ok((id, old_owner, removed_mtp))
+}
+
 fn profile_command(c: &Config, p: &Paths, a: Option<ProfileAction>) -> Result<()> {
     let mut profiles = Profiles::load(p)?;
     let mut refresh = false;
@@ -494,8 +609,21 @@ fn profile_command(c: &Config, p: &Paths, a: Option<ProfileAction>) -> Result<()
             benchmarks.save(p)?;
             refresh = true;
         }
-        Some(ProfileAction::Benchmark { name }) => {
-            let run = benchmark::run(c, p, &profiles, &name)?;
+        Some(ProfileAction::Benchmark { name, max_case }) => {
+            let max_cases = match max_case.as_deref() {
+                None | Some("all") => benchmark::TOTAL_CASES,
+                Some("small") => 1,
+                Some("medium") => 2,
+                Some("long") => benchmark::PREFILL_CASES.len(),
+                Some(other) => bail!("unknown case '{other}' - use small, medium, long, or all"),
+            };
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let handler_cancelled = cancelled.clone();
+            ctrlc::set_handler(move || {
+                handler_cancelled.store(true, Ordering::Relaxed);
+                eprintln!("cancelling - completing the current case and restoring the server…");
+            })?;
+            let run = benchmark::run_partial(c, p, &profiles, &name, cancelled, max_cases)?;
             println!("{}", benchmark::summary(&run));
         }
         Some(ProfileAction::Benchmarks { name }) => {
@@ -578,6 +706,19 @@ fn profile_command(c: &Config, p: &Paths, a: Option<ProfileAction>) -> Result<()
             profiles.save(p)?;
             refresh = true;
             println!("✓ set {key} on profile {name}");
+        }
+        Some(ProfileAction::SetModel { name, model }) => {
+            let (id, old_owner, removed_mtp) = retarget_profile(c, &mut profiles, &name, &model)?;
+            profiles.save(p)?;
+            refresh = true;
+            match old_owner {
+                Some(old) if old != id => println!("✓ profile {name} now uses model {id} (was {old})"),
+                Some(_) => println!("✓ profile {name} already uses model {id}"),
+                None => println!("✓ profile {name} now uses model {id}"),
+            }
+            if removed_mtp {
+                println!("⚠ removed draft-mtp speculation - model '{id}' lacks MTP tensors");
+            }
         }
     }
     if refresh {
@@ -770,7 +911,7 @@ fn flag_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 fn flag_u64(args: &[String], name: &str) -> Option<u64> {
     flag_value(args, name).and_then(|value| value.parse().ok())
 }
-fn ensure_model_not_loaded(c: &Config, p: &Paths, model: &str) -> Result<()> {
+pub(crate) fn ensure_model_not_loaded(c: &Config, p: &Paths, model: &str) -> Result<()> {
     if process::pid(p).is_none() {
         return Ok(());
     }
@@ -796,7 +937,7 @@ fn ensure_model_not_loaded(c: &Config, p: &Paths, model: &str) -> Result<()> {
     Ok(())
 }
 
-fn refresh_swap(c: &Config, p: &Paths) -> Result<()> {
+pub(crate) fn refresh_swap(c: &Config, p: &Paths) -> Result<()> {
     if process::pid(p).is_some() {
         let profiles = Profiles::load(p)?;
         process::write_swap_config(c, p, &profiles)?;

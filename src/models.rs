@@ -259,6 +259,8 @@ pub struct GgufMetadata {
     pub nextn_layers: Option<u64>,
     pub mtp_markers: Vec<String>,
     pub tokenizer: Option<TokenizerMetadata>,
+    pub architecture: String,
+    pub full_attention_interval: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -293,6 +295,22 @@ type TensorInfo = (String, Option<usize>, u64);
 type TensorCache = HashMap<PathBuf, (Vec<FileStamp>, Vec<TensorInfo>)>;
 static TENSOR_CACHE: LazyLock<Mutex<TensorCache>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Bump when the persisted metadata schema changes so stale caches (which may
+/// lack fields such as `architecture`) are discarded and re-read from disk.
+const METADATA_CACHE_VERSION: u32 = 2;
+
+#[derive(Deserialize)]
+struct MetadataCacheFile {
+    version: u32,
+    models: HashMap<PathBuf, CachedMetadata>,
+}
+
+#[derive(Serialize)]
+struct MetadataCacheFileRef<'a> {
+    version: u32,
+    models: &'a HashMap<PathBuf, CachedMetadata>,
+}
+
 fn file_stamp(path: &Path) -> Option<FileStamp> {
     let metadata = fs::metadata(path).ok()?;
     Some(FileStamp {
@@ -313,11 +331,14 @@ pub fn init_metadata_cache(paths: &Paths) {
         let Ok(text) = fs::read_to_string(&paths.metadata_cache) else {
             return;
         };
-        let Ok(cache) = serde_json::from_str::<HashMap<PathBuf, CachedMetadata>>(&text) else {
+        let Ok(file) = serde_json::from_str::<MetadataCacheFile>(&text) else {
             return;
         };
+        if file.version != METADATA_CACHE_VERSION {
+            return;
+        }
         if let Ok(mut memory) = METADATA_CACHE.lock() {
-            *memory = cache;
+            *memory = file.models;
         }
     });
 }
@@ -338,7 +359,11 @@ fn persist_metadata_cache() {
     let Ok(mut temporary) = tempfile::NamedTempFile::new_in(parent) else {
         return;
     };
-    if serde_json::to_writer(&mut temporary, &*cache).is_ok() {
+    let file = MetadataCacheFileRef {
+        version: METADATA_CACHE_VERSION,
+        models: &*cache,
+    };
+    if serde_json::to_writer(&mut temporary, &file).is_ok() {
         let _ = temporary.persist(path);
     }
 }
@@ -476,6 +501,10 @@ fn read_gguf_metadata(path: &Path, scan_markers: bool) -> Option<GgufMetadata> {
             .get(&key("nextn_predict_layers"))
             .and_then(MetaValue::number),
         mtp_markers: markers,
+        architecture: architecture.clone(),
+        full_attention_interval: values
+            .get(&key("full_attention_interval"))
+            .and_then(MetaValue::number),
         tokenizer: tokenizer.map(|mut tokenizer| {
             tokenizer.bos_token_id = values
                 .get("tokenizer.ggml.bos_token_id")
@@ -824,6 +853,13 @@ fn tensor_placement(
     })
 }
 
+/// Returns true when a hybrid SSM layer at `index` (0-based) keeps a
+/// context-sized KV cache: every `interval`-th regular layer is full
+/// attention, and trailing nextn/MTP blocks are always full attention.
+fn hybrid_layer_has_kv(index: u64, layers: u64, interval: u64, nextn: u64) -> bool {
+    index >= layers.saturating_sub(nextn) || (index + 1) % interval == 0
+}
+
 pub fn estimate(path: &Path, args: &[String]) -> Estimate {
     let weights = model_bytes(path);
     let metadata = basic_gguf_metadata(path);
@@ -850,6 +886,24 @@ pub fn estimate(path: &Path, args: &[String]) -> Estimate {
         .as_ref()
         .and_then(|item| item.block_count)
         .unwrap_or(1);
+    // The Qwen 3.5 family (qwen35 / qwen35moe) is hybrid SSM-attention: only
+    // every `full_attention_interval`-th layer (plus trailing nextn blocks)
+    // keeps a context-sized KV cache, while the SSM layers carry a constant
+    // recurrent state. Counting KV across every layer overestimates them ~4x.
+    let architecture = metadata
+        .as_ref()
+        .map(|meta| meta.architecture.as_str())
+        .unwrap_or("");
+    let full_attention_interval = metadata
+        .as_ref()
+        .and_then(|meta| meta.full_attention_interval)
+        .filter(|interval| *interval > 1);
+    let qwen35_hybrid = matches!(architecture, "qwen35" | "qwen35moe")
+        && full_attention_interval.is_some();
+    let nextn = metadata
+        .as_ref()
+        .and_then(|meta| meta.nextn_layers)
+        .unwrap_or(0);
     let ngl = value(&["-ngl", "--gpu-layers", "--n-gpu-layers"])
         .map(|item| {
             if matches!(item, "all" | "auto") {
@@ -952,11 +1006,23 @@ pub fn estimate(path: &Path, args: &[String]) -> Estimate {
                     if is_sliding { ctx.min(window) } else { ctx }
                 })
                 .unwrap_or(ctx);
-            kv_heads as f64
+            let bytes = kv_heads as f64
                 * (key as f64 * bpw(&["-ctk", "--cache-type-k"])
                     + val as f64 * bpw(&["-ctv", "--cache-type-v"]))
                 * layer_ctx as f64
-                * multiplier as f64
+                * multiplier as f64;
+            if qwen35_hybrid
+                && !hybrid_layer_has_kv(
+                    index as u64,
+                    layers,
+                    full_attention_interval.unwrap_or(1),
+                    nextn,
+                )
+            {
+                0.0
+            } else {
+                bytes
+            }
         })
         .collect::<Vec<_>>();
     let kv_full: f64 = kv_layers.iter().sum();
@@ -999,7 +1065,15 @@ pub fn estimate(path: &Path, args: &[String]) -> Estimate {
     };
     let buffers = input_buf + compute_buf;
 
-    let context_cal = if known_arch { 1.0 / 2.2 } else { 1.0 };
+    let context_cal = if qwen35_hybrid {
+        // Hybrid KV head dims are exact in the GGUF; the dense-attention
+        // calibration factor does not apply.
+        1.0
+    } else if known_arch {
+        1.0 / 2.2
+    } else {
+        1.0
+    };
     let projector = model_args(path)
         .windows(2)
         .find(|items| items[0] == "--mmproj")
@@ -1192,8 +1266,9 @@ pub fn model_args(path: &Path) -> Vec<String> {
 }
 
 pub fn delete(cfg: &Config, id: &str) -> Result<Vec<PathBuf>> {
-    let model = scan(cfg)
-        .into_iter()
+    let all = scan(cfg);
+    let model = all
+        .iter()
         .find(|m| m.id == id)
         .with_context(|| format!("unknown model '{id}'"))?;
     if cfg.scheduler_pinned_models.iter().any(|p| p == id) {
@@ -1201,15 +1276,24 @@ pub fn delete(cfg: &Config, id: &str) -> Result<Vec<PathBuf>> {
     }
     let mut files = parts(&model.path);
     if let Some(parent) = model.path.parent() {
-        files.extend(
-            fs::read_dir(parent)?
-                .filter_map(Result::ok)
-                .map(|e| e.path())
-                .filter(|p| {
-                    p.file_name()
-                        .is_some_and(|n| n.to_string_lossy().to_lowercase().starts_with("mmproj"))
-                }),
-        );
+        // The mmproj projector in a directory is auto-attached to every main
+        // model resolved from it. Only remove it when the model being deleted
+        // is itself a main model and no other main model in that directory
+        // still needs it; drafts never own a projector.
+        let sibling_main = all.iter().any(|m| {
+            m.id != id && m.kind == ModelKind::Main && m.path.parent() == Some(parent)
+        });
+        if model.kind == ModelKind::Main && !sibling_main {
+            files.extend(
+                fs::read_dir(parent)?
+                    .filter_map(Result::ok)
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.file_name()
+                            .is_some_and(|n| n.to_string_lossy().to_lowercase().starts_with("mmproj"))
+                    }),
+            );
+        }
     }
     for file in &files {
         fs::remove_file(file).with_context(|| format!("remove {}", file.display()))?;
@@ -1220,6 +1304,12 @@ pub fn delete(cfg: &Config, id: &str) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    fn sparse_model(dir: &Path, name: &str) {
+        let file = std::fs::File::create(dir.join(name)).unwrap();
+        file.set_len(60_000_000).unwrap();
+    }
 
     #[test]
     fn split_shard_suffix_is_removed_from_id() {
@@ -1233,6 +1323,51 @@ mod tests {
             sanitize_id("Publisher/Model Name (Q8)"),
             "publisher-model-name--q8-"
         );
+    }
+
+    #[test]
+    fn delete_keeps_mmproj_when_sibling_main_remains() {
+        let dir = tempdir().unwrap();
+        sparse_model(dir.path(), "a.gguf");
+        sparse_model(dir.path(), "b.gguf");
+        std::fs::write(dir.path().join("mmproj-v.gguf"), b"proj").unwrap();
+        let mut cfg = Config::default();
+        cfg.models_dirs = vec![dir.path().to_path_buf()];
+
+        let files = delete(&cfg, "a").unwrap();
+        assert_eq!(files.len(), 1, "mmproj must be kept for sibling main model");
+        assert!(!dir.path().join("a.gguf").exists());
+        assert!(dir.path().join("b.gguf").exists());
+        assert!(dir.path().join("mmproj-v.gguf").exists());
+    }
+
+    #[test]
+    fn delete_removes_mmproj_when_last_main_goes() {
+        let dir = tempdir().unwrap();
+        sparse_model(dir.path(), "a.gguf");
+        std::fs::write(dir.path().join("mmproj-v.gguf"), b"proj").unwrap();
+        let mut cfg = Config::default();
+        cfg.models_dirs = vec![dir.path().to_path_buf()];
+
+        let files = delete(&cfg, "a").unwrap();
+        assert_eq!(files.len(), 2, "model and its now-orphaned mmproj");
+        assert!(!dir.path().join("a.gguf").exists());
+        assert!(!dir.path().join("mmproj-v.gguf").exists());
+    }
+
+    #[test]
+    fn hybrid_kv_only_counts_full_attention_layers() {
+        // Qwen 3.5 family: interval 4, 64 regular layers + 1 nextn (65 total).
+        // Full attention sits at 0-based indices 3, 7, ..., 63 (16 layers)
+        // plus the trailing nextn block 64.
+        let full = (0..65)
+            .filter(|index| hybrid_layer_has_kv(*index, 65, 4, 1))
+            .count();
+        assert_eq!(full, 17);
+        assert!(hybrid_layer_has_kv(3, 65, 4, 1));
+        assert!(!hybrid_layer_has_kv(0, 65, 4, 1));
+        assert!(!hybrid_layer_has_kv(4, 65, 4, 1));
+        assert!(hybrid_layer_has_kv(64, 65, 4, 1));
     }
 
     #[test]

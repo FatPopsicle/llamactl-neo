@@ -38,12 +38,17 @@ use tui_checkbox::Checkbox;
 const PAGES: &[&str] = &[
     "Dashboard",
     "Models",
-    "Templates",
     "Profiles",
+    "Templates",
     "Search",
     "Settings",
     "Logs",
     "Maintenance",
+];
+
+/// Short labels for the compact (phone/narrow) workspace switcher.
+const COMPACT_PAGE_LABELS: &[&str] = &[
+    "Dash", "Model", "Prof", "Templ", "Search", "Set", "Logs", "Maint",
 ];
 type SlotSamples = BTreeMap<(String, usize), VecDeque<(Instant, u64, u64)>>;
 
@@ -59,6 +64,7 @@ struct App<'a> {
     filter: String,
     rename_input: Option<RenameState>,
     profile_delete_confirm: Option<String>,
+    model_delete_confirm: Option<String>,
     key_help: bool,
     profile_editor: Option<ProfileEditor>,
     benchmark_view: Option<BenchmarkView>,
@@ -162,6 +168,11 @@ struct TemplatePicker {
     selected: usize,
 }
 
+/// Pseudo-option appended after the downloaded templates in the template
+/// picker. Selecting it clears the profile's chat-template override so the
+/// model's own built-in template is used again.
+const BUILT_IN_TEMPLATE_OPTION: &str = "built-in (model default)";
+
 struct BenchmarkView {
     runs: Vec<benchmark::BenchmarkRun>,
 }
@@ -219,6 +230,13 @@ struct EditorSettings {
     rope_base: String,
     rope_scale: String,
     seed: String,
+    temperature: String,
+    top_k: String,
+    top_p: String,
+    min_p: String,
+    repeat_penalty: String,
+    presence_penalty: String,
+    frequency_penalty: String,
     reasoning: String,
     jinja: bool,
     chat_template: String,
@@ -261,6 +279,13 @@ impl Default for EditorSettings {
             rope_base: String::new(),
             rope_scale: String::new(),
             seed: String::new(),
+            temperature: String::new(),
+            top_k: String::new(),
+            top_p: String::new(),
+            min_p: String::new(),
+            repeat_penalty: String::new(),
+            presence_penalty: String::new(),
+            frequency_penalty: String::new(),
             reasoning: String::new(),
             jinja: true,
             chat_template: String::new(),
@@ -307,6 +332,13 @@ enum EditorField {
     OverrideTensor,
     RopeBase,
     RopeScale,
+    Temperature,
+    TopK,
+    TopP,
+    MinP,
+    RepeatPenalty,
+    PresencePenalty,
+    FrequencyPenalty,
     Seed,
     Reasoning,
     Jinja,
@@ -659,6 +691,7 @@ impl<'a> App<'a> {
             filter: String::new(),
             rename_input: None,
             profile_delete_confirm: None,
+            model_delete_confirm: None,
             key_help: false,
             profile_editor: None,
             benchmark_view: None,
@@ -1004,8 +1037,8 @@ impl<'a> App<'a> {
     fn count(&self) -> usize {
         match self.page {
             1 => self.visible_models().len(),
-            2 => self.templates.templates.len(),
-            3 => self.profiles.profiles.len(),
+            2 => self.profiles.profiles.len(),
+            3 => self.templates.templates.len(),
             4 => {
                 if self.hf.search_templates {
                     self.hf.template_hits.len()
@@ -1971,25 +2004,26 @@ impl<'a> App<'a> {
         })
     }
     fn open_template_picker(&mut self) {
-        let options = self.templates.templates.keys().cloned().collect::<Vec<_>>();
-        if options.is_empty() {
-            self.notice = "No saved templates - add them on the Search or Templates page".into();
-            return;
-        }
+        let mut options = self.templates.templates.keys().cloned().collect::<Vec<_>>();
+        options.push(BUILT_IN_TEMPLATE_OPTION.to_owned());
         let current = self
             .profile_editor
             .as_ref()
             .map(|editor| editor.settings.chat_template.clone())
             .unwrap_or_default();
-        let selected = options
-            .iter()
-            .position(|name| {
-                self.templates
-                    .templates
-                    .get(name)
-                    .is_some_and(|template| *template == current)
-            })
-            .unwrap_or(0);
+        let selected = if current.is_empty() {
+            options.len() - 1
+        } else {
+            options
+                .iter()
+                .position(|name| {
+                    self.templates
+                        .templates
+                        .get(name)
+                        .is_some_and(|template| *template == current)
+                })
+                .unwrap_or(0)
+        };
         self.template_picker = Some(TemplatePicker { options, selected });
     }
     fn handle_template_picker(&mut self, key: KeyEvent) {
@@ -2024,16 +2058,25 @@ impl<'a> App<'a> {
                     .cloned();
                 self.template_picker = None;
                 if let Some(name) = name {
-                    let template = self
-                        .templates
-                        .templates
-                        .get(&name)
-                        .cloned()
-                        .unwrap_or_default();
-                    if let Some(editor) = self.profile_editor.as_mut() {
-                        editor.settings.chat_template = template;
-                        editor.settings.jinja = true;
-                        editor.notice = format!("Applied template {name}");
+                    if name == BUILT_IN_TEMPLATE_OPTION {
+                        if let Some(editor) = self.profile_editor.as_mut() {
+                            editor.settings.chat_template.clear();
+                            editor.settings.chat_template_file.clear();
+                            editor.notice =
+                                "Cleared chat template - using model built-in".into();
+                        }
+                    } else {
+                        let template = self
+                            .templates
+                            .templates
+                            .get(&name)
+                            .cloned()
+                            .unwrap_or_default();
+                        if let Some(editor) = self.profile_editor.as_mut() {
+                            editor.settings.chat_template = template;
+                            editor.settings.jinja = true;
+                            editor.notice = format!("Applied template {name}");
+                        }
                     }
                     self.spawn_editor_estimate();
                 }
@@ -2429,6 +2472,15 @@ impl<'a> App<'a> {
             ]
             .map(str::to_owned)
             .to_vec(),
+            EditorField::Temperature => ["0.0", "0.4", "0.6", "0.7", "0.8", "1.0"]
+                .map(str::to_owned)
+                .to_vec(),
+            EditorField::TopK => ["0", "20", "40", "80"].map(str::to_owned).to_vec(),
+            EditorField::TopP => ["0.8", "0.9", "0.95", "1.0"].map(str::to_owned).to_vec(),
+            EditorField::MinP => ["0.0", "0.05", "0.1"].map(str::to_owned).to_vec(),
+            EditorField::RepeatPenalty => ["1.0", "1.1", "1.2"].map(str::to_owned).to_vec(),
+            EditorField::PresencePenalty => ["0.0", "1.5", "2.0"].map(str::to_owned).to_vec(),
+            EditorField::FrequencyPenalty => ["0.0", "0.3", "0.5"].map(str::to_owned).to_vec(),
             EditorField::Fit => ["on", "off"].map(str::to_owned).to_vec(),
             EditorField::Numa => ["off", "distribute", "isolate"].map(str::to_owned).to_vec(),
             _ => vec![],
@@ -2478,6 +2530,13 @@ impl<'a> App<'a> {
             EditorField::OverrideTensor => s.override_tensor = raw.to_owned(),
             EditorField::RopeBase => s.rope_base = raw.to_owned(),
             EditorField::RopeScale => s.rope_scale = raw.to_owned(),
+            EditorField::Temperature => s.temperature = raw.to_owned(),
+            EditorField::TopK => s.top_k = raw.to_owned(),
+            EditorField::TopP => s.top_p = raw.to_owned(),
+            EditorField::MinP => s.min_p = raw.to_owned(),
+            EditorField::RepeatPenalty => s.repeat_penalty = raw.to_owned(),
+            EditorField::PresencePenalty => s.presence_penalty = raw.to_owned(),
+            EditorField::FrequencyPenalty => s.frequency_penalty = raw.to_owned(),
             EditorField::Seed => s.seed = raw.to_owned(),
             EditorField::Reasoning => s.reasoning = raw.to_owned(),
             EditorField::Jinja => s.jinja = on(),
@@ -2616,6 +2675,22 @@ impl<'a> App<'a> {
             ),
             EditorField::RopeBase => ("RoPE frequency base", editor.settings.rope_base.clone()),
             EditorField::RopeScale => ("RoPE frequency scale", editor.settings.rope_scale.clone()),
+            EditorField::Temperature => ("Temperature", editor.settings.temperature.clone()),
+            EditorField::TopK => ("Top-K (0 = disabled)", editor.settings.top_k.clone()),
+            EditorField::TopP => ("Top-P (1.0 = disabled)", editor.settings.top_p.clone()),
+            EditorField::MinP => ("Min-P (0.0 = disabled)", editor.settings.min_p.clone()),
+            EditorField::RepeatPenalty => (
+                "Repeat penalty (1.0 = disabled)",
+                editor.settings.repeat_penalty.clone(),
+            ),
+            EditorField::PresencePenalty => (
+                "Presence penalty",
+                editor.settings.presence_penalty.clone(),
+            ),
+            EditorField::FrequencyPenalty => (
+                "Frequency penalty",
+                editor.settings.frequency_penalty.clone(),
+            ),
             EditorField::Seed => ("Seed (blank = random)", editor.settings.seed.clone()),
             EditorField::Reasoning => (
                 "Reasoning (on / off / auto)",
@@ -2758,6 +2833,65 @@ impl<'a> App<'a> {
                 EditorField::RopeBase => editor.settings.rope_base = text,
                 EditorField::RopeScale => editor.settings.rope_scale = text,
                 EditorField::Seed => editor.settings.seed = text,
+                EditorField::Temperature => {
+                    if text.is_empty() || text.parse::<f64>().is_ok() {
+                        editor.settings.temperature = text;
+                    } else {
+                        editor.notice = "✗ Temperature must be a number (empty = default)".into();
+                        ok = false;
+                    }
+                }
+                EditorField::TopK => {
+                    if text.is_empty() || text.parse::<u64>().is_ok() {
+                        editor.settings.top_k = text;
+                    } else {
+                        editor.notice = "✗ Top-K must be a whole number (empty = default)".into();
+                        ok = false;
+                    }
+                }
+                EditorField::TopP => {
+                    if text.is_empty() || text.parse::<f64>().is_ok() {
+                        editor.settings.top_p = text;
+                    } else {
+                        editor.notice = "✗ Top-P must be a number (empty = default)".into();
+                        ok = false;
+                    }
+                }
+                EditorField::MinP => {
+                    if text.is_empty() || text.parse::<f64>().is_ok() {
+                        editor.settings.min_p = text;
+                    } else {
+                        editor.notice = "✗ Min-P must be a number (empty = default)".into();
+                        ok = false;
+                    }
+                }
+                EditorField::RepeatPenalty => {
+                    if text.is_empty() || text.parse::<f64>().is_ok() {
+                        editor.settings.repeat_penalty = text;
+                    } else {
+                        editor.notice =
+                            "✗ Repeat penalty must be a number (empty = default)".into();
+                        ok = false;
+                    }
+                }
+                EditorField::PresencePenalty => {
+                    if text.is_empty() || text.parse::<f64>().is_ok() {
+                        editor.settings.presence_penalty = text;
+                    } else {
+                        editor.notice =
+                            "✗ Presence penalty must be a number (empty = default)".into();
+                        ok = false;
+                    }
+                }
+                EditorField::FrequencyPenalty => {
+                    if text.is_empty() || text.parse::<f64>().is_ok() {
+                        editor.settings.frequency_penalty = text;
+                    } else {
+                        editor.notice =
+                            "✗ Frequency penalty must be a number (empty = default)".into();
+                        ok = false;
+                    }
+                }
                 EditorField::Reasoning => editor.settings.reasoning = text,
                 EditorField::ChatTemplate => editor.settings.chat_template = text,
                 EditorField::ChatTemplateKwargs => {
@@ -3040,6 +3174,64 @@ impl<'a> App<'a> {
             }
             _ => {}
         }
+    }
+    fn request_model_delete(&mut self) {
+        let Some(id) = self
+            .visible_models()
+            .get(self.selected)
+            .map(|model| model.id.clone())
+        else {
+            return;
+        };
+        if self.cfg.scheduler_pinned_models.contains(&id) {
+            self.notice = "✗ Unpin this model before deleting it".into();
+            return;
+        }
+        self.model_delete_confirm = Some(id);
+    }
+    fn handle_model_delete_confirm(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('y') => {
+                if let Some(id) = self.model_delete_confirm.take() {
+                    self.delete_model(&id);
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('n') => {
+                self.model_delete_confirm = None;
+                self.notice = "Model deletion cancelled".into();
+            }
+            _ => {}
+        }
+    }
+    fn delete_model(&mut self, id: &str) {
+        let id = id.to_owned();
+        let cfg = self.cfg.clone();
+        let paths = self.paths.clone();
+        let mut profiles = self.profiles.clone();
+        self.selected = self.selected.saturating_sub(1);
+        self.spawn_task(format!("deleting model {id}"), move || {
+            crate::ensure_model_not_loaded(&cfg, &paths, &id)?;
+            models::delete(&cfg, &id)?;
+            let removed = profiles
+                .profiles
+                .iter()
+                .filter(|(_, profile)| {
+                    profile.get("_model").and_then(Value::as_str) == Some(&id)
+                })
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>();
+            for profile in &removed {
+                profiles.remove(profile)?;
+            }
+            profiles.models.remove(&id);
+            profiles.save(&paths)?;
+            crate::refresh_swap(&cfg, &paths)?;
+            Ok(if removed.is_empty() {
+                format!("Deleted model {id}")
+            } else {
+                format!("Deleted model {id} and {} related profile(s)", removed.len())
+            })
+        });
     }
     fn request_profile_delete(&mut self) {
         let Some(profile) = self.selected_profile() else {
@@ -3527,7 +3719,7 @@ impl<'a> App<'a> {
                     }
                 }
             }
-            3 => {
+            2 => {
                 self.start_exact_profile();
                 return;
             }
@@ -3578,7 +3770,7 @@ impl<'a> App<'a> {
             },
             5 => self.toggle_setting(1),
             4 => self.hf_action(),
-            2 => {
+            3 => {
                 if let Some(name) = self.selected_template_name() {
                     self.open_template_editor(name);
                 } else {
@@ -3706,6 +3898,9 @@ pub fn run(cfg: Config, paths: &Paths) -> Result<()> {
                         _ if app.profile_delete_confirm.is_some() => {
                             app.handle_profile_delete_confirm(k)
                         }
+                        _ if app.model_delete_confirm.is_some() => {
+                            app.handle_model_delete_confirm(k)
+                        }
                         _ if app.benchmark_view.is_some() => app.handle_benchmark_view(k),
                         _ if app.runtime_picker.is_some() => app.handle_runtime_picker(k),
                         _ if app.template_picker.is_some() => app.handle_template_picker(k),
@@ -3735,8 +3930,8 @@ pub fn run(cfg: Config, paths: &Paths) -> Result<()> {
                         KeyCode::Home => app.selected = 0,
                         KeyCode::End => app.selected = app.count().saturating_sub(1),
                         KeyCode::Enter => app.action(),
-                        KeyCode::Char('R') if app.page == 3 => app.start_profile_rename(),
-                        KeyCode::Char('e') if app.page == 3 => app.open_profile_editor(),
+                        KeyCode::Char('R') if app.page == 2 => app.start_profile_rename(),
+                        KeyCode::Char('e') if app.page == 2 => app.open_profile_editor(),
                         KeyCode::Char('/') | KeyCode::Char('s') if app.page == 4 => {
                             app.open_hf_search_modal();
                         }
@@ -3748,16 +3943,16 @@ pub fn run(cfg: Config, paths: &Paths) -> Result<()> {
                         KeyCode::Char('i') if app.page == 4 => app.show_hf_details(),
                         KeyCode::Char('r') if app.page == 4 => app.refresh_hf_page(),
                         KeyCode::Char('t') if app.page == 4 => app.toggle_hf_search_mode(),
-                        KeyCode::Char('e') if app.page == 2 => {
+                        KeyCode::Char('e') if app.page == 3 => {
                             if let Some(name) = app.selected_template_name() {
                                 app.open_template_editor(name);
                             }
                         }
-                        KeyCode::Char('a') if app.page == 2 => app.request_template_name(None),
-                        KeyCode::Char('R') if app.page == 2 => {
+                        KeyCode::Char('a') if app.page == 3 => app.request_template_name(None),
+                        KeyCode::Char('R') if app.page == 3 => {
                             app.request_template_name(app.selected_template_name())
                         }
-                        KeyCode::Char('d') if app.page == 2 => app.request_template_delete(),
+                        KeyCode::Char('d') if app.page == 3 => app.request_template_delete(),
                         KeyCode::Char('r') => {
                             app.refresh();
                             app.notice = "Refreshed".into()
@@ -3779,17 +3974,18 @@ pub fn run(cfg: Config, paths: &Paths) -> Result<()> {
                                 });
                             }
                         }
-                        KeyCode::Char('m') if app.page == 3 => app.request_profile_benchmark(),
-                        KeyCode::Char('v') if app.page == 3 => app.show_profile_benchmarks(),
-                        KeyCode::Char('c') if app.page == 3 => app.profile_clone_selected(),
-                        KeyCode::Char('d') if app.page == 3 => app.request_profile_delete(),
-                        KeyCode::Char('p') if app.page == 3 => app.toggle_profile_pin(),
-                        KeyCode::Char('b') if app.page == 3 => app.bind_selected_profile(),
-                        KeyCode::Char(c) if app.page == 3 && "+-[]tfk".contains(c) => {
+                        KeyCode::Char('d') if app.page == 1 => app.request_model_delete(),
+                        KeyCode::Char('m') if app.page == 2 => app.request_profile_benchmark(),
+                        KeyCode::Char('v') if app.page == 2 => app.show_profile_benchmarks(),
+                        KeyCode::Char('c') if app.page == 2 => app.profile_clone_selected(),
+                        KeyCode::Char('d') if app.page == 2 => app.request_profile_delete(),
+                        KeyCode::Char('p') if app.page == 2 => app.toggle_profile_pin(),
+                        KeyCode::Char('b') if app.page == 2 => app.bind_selected_profile(),
+                        KeyCode::Char(c) if app.page == 2 && "+-[]tfk".contains(c) => {
                             app.adjust_profile(c)
                         }
-                        KeyCode::Char('=') if app.page == 3 => app.adjust_profile('+'),
-                        KeyCode::Char('u') if app.page == 3 => {
+                        KeyCode::Char('=') if app.page == 2 => app.adjust_profile('+'),
+                        KeyCode::Char('u') if app.page == 2 => {
                             if let Some(profile) = app.selected_profile() {
                                 let cfg = app.cfg.clone();
                                 let profiles = app.profiles.clone();
@@ -3830,27 +4026,14 @@ fn draw_loading(frame: &mut ratatui::Frame, app: &App) {
         .nth((elapsed * 4.0) as usize % spinner.chars().count())
         .unwrap_or('-');
     let body = format!("\n {ch} Loading model library…\n\n elapsed {elapsed:.0}s");
-    let center = if area.width > 32 && area.height > 9 {
-        let vertical = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(40),
-                Constraint::Length(6),
-                Constraint::Min(0),
-            ])
-            .split(area);
-        let horizontal = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(30),
-                Constraint::Min(40),
-                Constraint::Percentage(30),
-            ])
-            .split(vertical[1]);
-        horizontal[1]
-    } else {
-        area
-    };
+    let width = area.width.min(40);
+    let height = 6.min(area.height);
+    let center = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
     frame.render_widget(
         Paragraph::new(body)
             .style(Style::default().fg(Color::Cyan))
@@ -3917,6 +4100,9 @@ fn page_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     if app.template_delete_confirm.is_some() {
         return vec![("Enter/y", "delete"), ("Esc/q/n", "cancel")];
     }
+    if app.model_delete_confirm.is_some() {
+        return vec![("Enter/y", "delete"), ("Esc/q/n", "cancel")];
+    }
     if app.profile_delete_confirm.is_some() {
         return vec![("Enter/y", "delete"), ("Esc/q/n", "cancel")];
     }
@@ -3971,11 +4157,12 @@ fn page_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             ("Enter", "load model"),
             ("c", "create profile"),
             ("u", "unload"),
+            ("d", "delete"),
             ("r", "refresh"),
             ("?", "controls"),
             ("q", "quit"),
         ],
-        3 => vec![
+        2 => vec![
             ("Enter", "load"),
             ("m/v", "benchmark/results"),
             ("e/R/c/d", "edit/rename/clone/delete"),
@@ -4037,7 +4224,7 @@ fn page_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             ("?", "controls"),
             ("q", "quit"),
         ],
-        2 => vec![
+        3 => vec![
             ("Enter/e", "edit"),
             ("a", "add"),
             ("R", "rename"),
@@ -4079,16 +4266,24 @@ fn notice_color(notice: &str) -> Color {
 
 fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     let area = frame.area();
-    if area.width < 72 || area.height < 18 {
+    if area.width < 24 || area.height < 8 {
         frame.render_widget(
-            Paragraph::new(
-                "llamactl NEO\n\nResize terminal to at least 72×18.\nq quit - r refresh",
-            )
-            .style(Style::default().fg(Color::Yellow)),
+            Paragraph::new("llamactl NEO\n\nNeed 24×8 or larger.\nq quit - r refresh")
+                .style(Style::default().fg(Color::Yellow)),
             area,
         );
         return;
     }
+    if area.width < 72 {
+        draw_compact(frame, app, area);
+    } else {
+        draw_full(frame, app, area);
+    }
+}
+
+/// Standard desktop layout: telemetry strip, fixed workspace sidebar, and a
+/// wide content pane. Unchanged from the original design.
+fn draw_full(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -4098,67 +4293,60 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             Constraint::Length(1),
         ])
         .split(area);
-    let (status_line, status_color) = if let Some(editor) = &app.profile_editor {
-        if let Some(prompt) = &editor.prompt {
-            let mut text = prompt.text.clone();
-            let byte = text
-                .char_indices()
-                .nth(prompt.cursor)
-                .map(|(i, _)| i)
-                .unwrap_or(text.len());
-            text.insert(byte, '▏');
-            (
-                format!(" {}: {text} - Enter confirm - Esc cancel", prompt.label),
-                Color::DarkGray,
-            )
-        } else if editor.notice.is_empty() {
-            (format!(" {}", app.notice), notice_color(&app.notice))
-        } else {
-            (format!(" {}", editor.notice), notice_color(&editor.notice))
-        }
-    } else if let Some(state) = &app.rename_input {
-        let mut text = state.text.clone();
-        let byte = text
-            .char_indices()
-            .nth(state.cursor)
-            .map(|(i, _)| i)
-            .unwrap_or(text.len());
-        text.insert(byte, '▏');
-        (
-            format!(" RENAME PROFILE → {text} - Enter confirm - Esc cancel"),
-            Color::DarkGray,
-        )
-    } else if let Some(task) = &app.background {
-        (format!("{} …", task.label), Color::DarkGray)
-    } else {
-        (format!(" {}", app.notice), notice_color(&app.notice))
-    };
-    if app.background.is_some() {
-        let spinner_area = Rect {
-            x: outer[2].x + 1,
-            width: outer[2].width.saturating_sub(1),
-            ..outer[2]
-        };
-        frame.render_stateful_widget(
-            Throbber::default()
-                .label(status_line)
-                .style(Style::default().fg(status_color))
-                .throbber_style(Style::default().fg(Color::Cyan)),
-            spinner_area,
-            &mut app.throbber_state,
-        );
-    } else {
-        frame.render_widget(
-            Paragraph::new(status_line).style(Style::default().fg(status_color)),
-            outer[2],
-        );
-    }
-    frame.render_widget(Paragraph::new(legend_line(app)), outer[3]);
     draw_telemetry_strip(frame, app, outer[0]);
+    draw_status(frame, app, outer[2]);
+    frame.render_widget(Paragraph::new(legend_line(app)), outer[3]);
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(23), Constraint::Min(45)])
         .split(outer[1]);
+    draw_workspace_sidebar(frame, app, body[0]);
+    draw_page(frame, app, body[1]);
+    render_modals(frame, app, area);
+}
+
+/// Phone / narrow layout: a two-line telemetry summary, a compact two-row
+/// workspace switcher, and the full width handed to the active page.
+fn draw_compact(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    draw_telemetry_compact(frame, app, outer[0]);
+    draw_workspace_tabs(frame, app, outer[1]);
+    draw_page(frame, app, outer[2]);
+    draw_status(frame, app, outer[3]);
+    frame.render_widget(Paragraph::new(legend_line(app)), outer[4]);
+    render_modals(frame, app, area);
+}
+
+fn draw_page(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    match app.page {
+        0 => dashboard(frame, app, area),
+        1 => model_page(frame, app, area),
+        2 => {
+            if let Some(editor) = &app.profile_editor {
+                profile_editor_view(frame, app, editor, area);
+            } else {
+                profile_page(frame, app, area);
+            }
+        }
+        3 => template_page(frame, app, area),
+        4 => hf_download_page(frame, app, area),
+        5 => settings_page(frame, app, area),
+        6 => logs(frame, app, area),
+        7 => system(frame, app, area),
+        _ => dashboard(frame, app, area),
+    }
+}
+
+fn draw_workspace_sidebar(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let items = PAGES
         .iter()
         .enumerate()
@@ -4197,26 +4385,227 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                     .add_modifier(Modifier::BOLD),
             )
             .highlight_symbol("› "),
-        body[0],
+        area,
         &mut state,
     );
-    match app.page {
-        0 => dashboard(frame, app, body[1]),
-        1 => model_page(frame, app, body[1]),
-        2 => template_page(frame, app, body[1]),
-        3 => {
-            if let Some(editor) = &app.profile_editor {
-                profile_editor_view(frame, app, editor, body[1]);
-            } else {
-                profile_page(frame, app, body[1]);
+}
+
+/// Two rows of four short tabs so the switcher stays compact on narrow phones.
+fn draw_workspace_tabs(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(area);
+    for (row, row_area) in rows.iter().enumerate() {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Ratio(1, 4),
+                Constraint::Ratio(1, 4),
+                Constraint::Ratio(1, 4),
+                Constraint::Ratio(1, 4),
+            ])
+            .split(*row_area);
+        for col in 0..4 {
+            let index = row * 4 + col;
+            let mut label = format!("{}. {}", index + 1, COMPACT_PAGE_LABELS[index]);
+            if index == 7
+                && app
+                    .last_check
+                    .as_ref()
+                    .is_some_and(|(_, lc, _, sc)| *lc || *sc)
+            {
+                label.push_str(" ↑");
             }
+            let style = if index == app.page {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            frame.render_widget(Paragraph::new(Span::styled(label, style)), cols[col]);
         }
-        4 => hf_download_page(frame, app, body[1]),
-        5 => settings_page(frame, app, body[1]),
-        6 => logs(frame, app, body[1]),
-        7 => system(frame, app, body[1]),
-        _ => dashboard(frame, app, body[1]),
     }
+}
+
+/// Two-line telemetry for narrow screens: memory/temps on one line, serving
+/// state on the next.
+fn draw_telemetry_compact(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    let t = &app.telemetry;
+    let gib = (1u64 << 30) as f64;
+    let vram = if t.vram_total > 0 {
+        format!(
+            "{:.1}/{:.1}G",
+            t.vram_used as f64 / gib,
+            t.vram_total as f64 / gib
+        )
+    } else {
+        "—".into()
+    };
+    let ram = if t.ram_total > 0 {
+        format!(
+            "{:.1}/{:.1}G",
+            t.ram_used as f64 / gib,
+            t.ram_total as f64 / gib
+        )
+    } else {
+        "—".into()
+    };
+    let (temp, temp_color) = rotating_gpu_temp(&t.gpu_temps, app.marquee_started.elapsed());
+    let online = process::pid(app.paths).is_some();
+    let (status_icon, status_text, status_color) = if !online {
+        ("○", "STOPPED", Color::Red)
+    } else if t.model_state == ModelState::None {
+        ("✓", "SERVING", Color::Green)
+    } else if t.model_state == ModelState::Loading {
+        ("◐", "LOADING", Color::Yellow)
+    } else {
+        ("●", "", Color::Green)
+    };
+    let model = marquee_text(
+        &t.model_name,
+        area.width.saturating_sub(2) as usize,
+        app.marquee_started.elapsed(),
+    );
+    let prompt = if t.prompt_total > 0 {
+        format!(
+            "{:>3.0}%",
+            t.prompt_done as f64 * 100.0 / t.prompt_total as f64
+        )
+    } else if t.active_requests > 0 {
+        "  …".into()
+    } else {
+        " —".into()
+    };
+    let rate = t
+        .tokens_per_second
+        .map(|v| format!("{v:.1}"))
+        .unwrap_or("—".into());
+    let line_one = Line::from(vec![
+        Span::styled("VRAM ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            vram,
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  RAM ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            ram,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  GPU ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            temp,
+            Style::default()
+                .fg(temp_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    let line_two = Line::from(vec![
+        Span::styled(
+            format!("{status_icon} {status_text}"),
+            Style::default()
+                .fg(status_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("  {model}"), Style::default().fg(Color::Cyan)),
+        Span::styled("  P ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            prompt,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  TOK ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            t.generated.to_string(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  T/S ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            rate,
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  {} active", t.active_requests),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(vec![line_one, line_two]), area);
+}
+
+fn status_line(app: &App) -> (String, Color) {
+    if let Some(editor) = &app.profile_editor {
+        if let Some(prompt) = &editor.prompt {
+            let mut text = prompt.text.clone();
+            let byte = text
+                .char_indices()
+                .nth(prompt.cursor)
+                .map(|(i, _)| i)
+                .unwrap_or(text.len());
+            text.insert(byte, '▏');
+            (
+                format!(" {}: {text} - Enter confirm - Esc cancel", prompt.label),
+                Color::DarkGray,
+            )
+        } else if editor.notice.is_empty() {
+            (format!(" {}", app.notice), notice_color(&app.notice))
+        } else {
+            (format!(" {}", editor.notice), notice_color(&editor.notice))
+        }
+    } else if let Some(state) = &app.rename_input {
+        let mut text = state.text.clone();
+        let byte = text
+            .char_indices()
+            .nth(state.cursor)
+            .map(|(i, _)| i)
+            .unwrap_or(text.len());
+        text.insert(byte, '▏');
+        (
+            format!(" RENAME PROFILE → {text} - Enter confirm - Esc cancel"),
+            Color::DarkGray,
+        )
+    } else if let Some(task) = &app.background {
+        (format!("{} …", task.label), Color::DarkGray)
+    } else {
+        (format!(" {}", app.notice), notice_color(&app.notice))
+    }
+}
+
+fn draw_status(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
+    let (text, color) = status_line(app);
+    if app.background.is_some() {
+        let spinner_area = Rect {
+            x: area.x + 1,
+            width: area.width.saturating_sub(1),
+            ..area
+        };
+        frame.render_stateful_widget(
+            Throbber::default()
+                .label(text)
+                .style(Style::default().fg(color))
+                .throbber_style(Style::default().fg(Color::Cyan)),
+            spinner_area,
+            &mut app.throbber_state,
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new(text).style(Style::default().fg(color)),
+            area,
+        );
+    }
+}
+
+fn render_modals(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     if let Some(picker) = &app.runtime_picker {
         runtime_picker_modal(frame, picker, area);
     }
@@ -4228,6 +4617,9 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     }
     if let Some(profile) = &app.profile_delete_confirm {
         profile_delete_modal(frame, profile, area);
+    }
+    if let Some(model) = &app.model_delete_confirm {
+        model_delete_modal(frame, model, area);
     }
     if let Some(state) = &app.rename_input {
         rename_modal(frame, state, area);
@@ -4267,7 +4659,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
 }
 fn keyboard_help_modal(frame: &mut ratatui::Frame, area: Rect) {
     let width = area.width.saturating_sub(8).min(88);
-    let height = 19.min(area.height.saturating_sub(2));
+    let height = 20.min(area.height.saturating_sub(2));
     let modal = Rect::new(
         area.x + (area.width - width) / 2,
         area.y + (area.height - height) / 2,
@@ -4284,6 +4676,7 @@ fn keyboard_help_modal(frame: &mut ratatui::Frame, area: Rect) {
         ("r", "refresh the current state"),
         ("?", "open or close this control reference"),
         ("q / Ctrl+C", "quit; modal q cancels instead"),
+        ("Models: c / u / d", "create profile / unload / delete"),
         ("Profiles: m / v", "run benchmark / view results"),
         ("Profiles: e / R / c / d", "edit / rename / clone / delete"),
         ("Profiles: b / p / u", "bind / pin / unload"),
@@ -4309,6 +4702,37 @@ fn keyboard_help_modal(frame: &mut ratatui::Frame, area: Rect) {
                 ),
             )
             .block(title("KEYBOARD CONTROLS").padding(Padding::horizontal(1))),
+        modal,
+    );
+}
+fn model_delete_modal(frame: &mut ratatui::Frame, model: &str, area: Rect) {
+    let width = area.width.saturating_sub(12).min(80);
+    let height = 7.min(area.height.saturating_sub(2));
+    let modal = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, modal);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                format!("Permanently delete model {model}?"),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from("This also deletes profiles that use this model."),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Enter/y delete - Esc/q/n cancel",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])
+        .block(title("DELETE MODEL").padding(Padding::horizontal(1)))
+        .wrap(Wrap { trim: false }),
         modal,
     );
 }
@@ -4526,7 +4950,10 @@ fn benchmark_dialog_modal(
                 benchmark_case_table(completed),
                 Rect {
                     y: inner.y + 4,
-                    height: inner.height.saturating_sub(5).min(4),
+                    height: inner
+                        .height
+                        .saturating_sub(5)
+                        .min(benchmark::TOTAL_CASES as u16 + 1),
                     ..inner
                 },
             );
@@ -4546,7 +4973,7 @@ fn benchmark_dialog_modal(
 }
 fn benchmark_modal(frame: &mut ratatui::Frame, view: &BenchmarkView, area: Rect) {
     let width = area.width.saturating_sub(8).min(110);
-    let height = (view.runs.len() as u16 * 5 + 2)
+    let height = (view.runs.len() as u16 * (benchmark::TOTAL_CASES as u16 + 2) + 2)
         .max(7)
         .min(area.height.saturating_sub(2));
     let modal = Rect::new(
@@ -4560,8 +4987,8 @@ fn benchmark_modal(frame: &mut ratatui::Frame, view: &BenchmarkView, area: Rect)
     let inner = block.inner(modal);
     frame.render_widget(block, modal);
     for (index, run) in view.runs.iter().rev().enumerate() {
-        let y = inner.y + index as u16 * 5;
-        let partial = if run.cases.len() < 3 {
+        let y = inner.y + index as u16 * (benchmark::TOTAL_CASES as u16 + 2);
+        let partial = if run.cases.len() < benchmark::TOTAL_CASES {
             " - PARTIAL"
         } else {
             ""
@@ -4620,56 +5047,64 @@ fn benchmark_metadata_line(runtime: &str, context: u64, load_ms: u64) -> Line<'s
     ])
 }
 fn benchmark_case_table(cases: &[benchmark::BenchmarkCase]) -> Table<'static> {
-    let rows =
-        [("small", "SMALL"), ("medium", "MEDIUM"), ("long", "LARGE")].map(|(name, label)| {
-            let case = cases.iter().find(|case| case.name == name);
-            let placeholder =
-                || Line::from(Span::styled("--", Style::default().fg(Color::DarkGray)));
-            let metric = |value: Option<f64>, color| {
-                value
-                    .map(|value| {
-                        Line::from(Span::styled(
-                            format!("{value:.1}"),
-                            Style::default().fg(color),
-                        ))
-                    })
-                    .unwrap_or_else(&placeholder)
-            };
-            Row::new(vec![
-                Line::from(Span::styled(
-                    label,
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                case.map(|case| Line::raw(case.actual_prompt_tokens.to_string()))
-                    .unwrap_or_else(&placeholder),
-                metric(
-                    case.map(|case| case.prompt_tokens_per_second),
-                    Color::Yellow,
-                ),
-                metric(case.map(|case| case.decode_tokens_per_second), Color::Green),
-                metric(
-                    case.map(|case| case.decode_peak_tokens_per_second),
-                    Color::Green,
-                ),
-                metric(
-                    case.map(|case| case.decode_median_tokens_per_second),
-                    Color::Green,
-                ),
-                case.map(|case| {
+    let rows = [
+        ("prefill-short", "PREFILL SHORT"),
+        ("prefill-medium", "PREFILL MEDIUM"),
+        ("prefill-long", "PREFILL LONG"),
+        ("coding-single", "CODING 1x"),
+        ("coding-slots", "CODING Nx"),
+        ("prose-en-single", "PROSE EN 1x"),
+        ("prose-en-slots", "PROSE EN Nx"),
+        ("prose-zh-single", "PROSE ZH 1x"),
+        ("prose-zh-slots", "PROSE ZH Nx"),
+    ]
+    .map(|(name, label)| {
+        let case = cases.iter().find(|case| case.name == name);
+        let placeholder = || Line::from(Span::styled("--", Style::default().fg(Color::DarkGray)));
+        let metric = |value: Option<f64>, color| {
+            value
+                .map(|value| {
                     Line::from(Span::styled(
-                        format!("{:.2}s", case.time_to_first_response_ms / 1000.0),
-                        Style::default().fg(Color::Yellow),
+                        format!("{value:.1}"),
+                        Style::default().fg(color),
                     ))
                 })
-                .unwrap_or_else(&placeholder),
-            ])
-        });
+                .unwrap_or_else(&placeholder)
+        };
+        let is_prefill = case.is_some_and(|case| case.kind == "prefill");
+        Row::new(vec![
+            Line::from(Span::styled(
+                label,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            case.map(|case| {
+                let tokens = if is_prefill {
+                    case.actual_prompt_tokens
+                } else {
+                    case.actual_decode_tokens
+                };
+                Line::raw(tokens.to_string())
+            })
+            .unwrap_or_else(&placeholder),
+            metric(case.map(|case| case.prompt_tokens_per_second), Color::Yellow),
+            metric(case.map(|case| case.decode_tokens_per_second), Color::Green),
+            metric(case.map(|case| case.decode_peak_tokens_per_second), Color::Green),
+            metric(case.map(|case| case.decode_median_tokens_per_second), Color::Green),
+            case.map(|case| {
+                Line::from(Span::styled(
+                    format!("{:.2}s", case.time_to_first_response_ms / 1000.0),
+                    Style::default().fg(Color::Yellow),
+                ))
+            })
+            .unwrap_or_else(&placeholder),
+        ])
+    });
     Table::new(
         rows,
         [
-            Constraint::Length(9),
+            Constraint::Length(14),
             Constraint::Length(10),
             Constraint::Length(10),
             Constraint::Length(10),
@@ -4679,14 +5114,12 @@ fn benchmark_case_table(cases: &[benchmark::BenchmarkCase]) -> Table<'static> {
         ],
     )
     .header(
-        Row::new([
-            "CASE", "TOKENS", "PP T/S", "DEC T/S", "PEAK", "MEDIAN", "FIRST",
-        ])
-        .style(
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Row::new(["CASE", "TOKENS", "PP T/S", "DEC T/S", "PEAK", "MEDIAN", "FIRST"])
+            .style(
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
     )
 }
 fn runtime_picker_modal(frame: &mut ratatui::Frame, picker: &RuntimePicker, area: Rect) {
@@ -4696,8 +5129,12 @@ fn runtime_picker_modal(frame: &mut ratatui::Frame, picker: &RuntimePicker, area
         .map(|runtime| runtime.chars().count())
         .max()
         .unwrap_or(0) as u16;
-    let width = (content_width + 6).clamp(48, area.width.saturating_sub(4));
-    let height = (picker.options.len() as u16 + 2).clamp(5, area.height.saturating_sub(4));
+    let width = (content_width + 6)
+        .max(48)
+        .min(area.width.saturating_sub(2));
+    let height = (picker.options.len() as u16 + 2)
+        .max(5)
+        .min(area.height.saturating_sub(2));
     let modal = Rect::new(
         area.x + (area.width - width) / 2,
         area.y + (area.height - height) / 2,
@@ -4732,8 +5169,12 @@ fn template_picker_modal(frame: &mut ratatui::Frame, picker: &TemplatePicker, ar
         .map(|name| name.chars().count())
         .max()
         .unwrap_or(0) as u16;
-    let width = (content_width + 6).clamp(48, area.width.saturating_sub(4));
-    let height = (picker.options.len() as u16 + 2).clamp(5, area.height.saturating_sub(4));
+    let width = (content_width + 6)
+        .max(48)
+        .min(area.width.saturating_sub(2));
+    let height = (picker.options.len() as u16 + 2)
+        .max(5)
+        .min(area.height.saturating_sub(2));
     let modal = Rect::new(
         area.x + (area.width - width) / 2,
         area.y + (area.height - height) / 2,
@@ -5007,6 +5448,22 @@ fn temperature_color(temperatures: &[f64]) -> Color {
     } else {
         Color::Green
     }
+}
+
+/// Cycles through each GPU so every device's temperature is shown instead of
+/// collapsing to the hottest. Single-GPU setups show a bare reading; multi-GPU
+/// setups rotate through `GPU i` every couple of seconds.
+fn rotating_gpu_temp(temperatures: &[f64], elapsed: Duration) -> (String, Color) {
+    if temperatures.is_empty() {
+        return ("—".into(), Color::DarkGray);
+    }
+    if temperatures.len() == 1 {
+        let temp = temperatures[0];
+        return (format!("{temp:.0}°C"), temperature_color(&[temp]));
+    }
+    let index = (elapsed.as_secs_f64() / 2.0) as usize % temperatures.len();
+    let temp = temperatures[index];
+    (format!("{index}: {temp:.0}°C"), temperature_color(&[temp]))
 }
 
 fn title(name: &str) -> Block<'static> {
@@ -6541,6 +6998,18 @@ const EDITOR_BASIC_CATEGORIES: &[EditorCategory] = &[
             EditorField::DraftCpuMoe,
         ],
     },
+    EditorCategory {
+        label: "SAMPLING",
+        fields: &[
+            EditorField::Temperature,
+            EditorField::TopK,
+            EditorField::TopP,
+            EditorField::MinP,
+            EditorField::RepeatPenalty,
+            EditorField::PresencePenalty,
+            EditorField::FrequencyPenalty,
+        ],
+    },
 ];
 const EDITOR_TEMPLATE_CATEGORY: EditorCategory = EditorCategory {
     label: "CHAT TEMPLATE",
@@ -6666,6 +7135,13 @@ fn editor_field_label(field: EditorField) -> &'static str {
         EditorField::OverrideTensor => "Override tensor",
         EditorField::RopeBase => "RoPE frequency base",
         EditorField::RopeScale => "RoPE frequency scale",
+        EditorField::Temperature => "Temperature",
+        EditorField::TopK => "Top-K",
+        EditorField::TopP => "Top-P",
+        EditorField::MinP => "Min-P",
+        EditorField::RepeatPenalty => "Repeat penalty",
+        EditorField::PresencePenalty => "Presence penalty",
+        EditorField::FrequencyPenalty => "Frequency penalty",
         EditorField::Seed => "Seed",
         EditorField::Reasoning => "Reasoning",
         EditorField::Jinja => "Jinja templates",
@@ -6675,6 +7151,13 @@ fn editor_field_label(field: EditorField) -> &'static str {
 }
 fn editor_field_value(field: EditorField, settings: &EditorSettings) -> String {
     let onoff = |value: bool| if value { "on" } else { "off" }.to_owned();
+    let default_or = |value: &str| {
+        if value.is_empty() {
+            "(default)".to_owned()
+        } else {
+            value.to_owned()
+        }
+    };
     match field {
         EditorField::Ctx => settings.ctx.to_string(),
         EditorField::ContextStep => settings.context_step.to_string(),
@@ -6757,6 +7240,13 @@ fn editor_field_value(field: EditorField, settings: &EditorSettings) -> String {
                 settings.rope_scale.clone()
             }
         }
+        EditorField::Temperature => default_or(&settings.temperature),
+        EditorField::TopK => default_or(&settings.top_k),
+        EditorField::TopP => default_or(&settings.top_p),
+        EditorField::MinP => default_or(&settings.min_p),
+        EditorField::RepeatPenalty => default_or(&settings.repeat_penalty),
+        EditorField::PresencePenalty => default_or(&settings.presence_penalty),
+        EditorField::FrequencyPenalty => default_or(&settings.frequency_penalty),
         EditorField::Seed => {
             if settings.seed.is_empty() {
                 "(random)".into()
@@ -6837,6 +7327,16 @@ fn editor_settings_from_profile(profile: &serde_json::Map<String, Value>) -> Edi
             .unwrap_or(default)
             .to_owned()
     };
+    let sv = |key: &str, default: &str| {
+        profile
+            .get(key)
+            .map(|value| match value {
+                Value::String(text) => text.clone(),
+                Value::Number(number) => number.to_string(),
+                other => other.to_string(),
+            })
+            .unwrap_or_else(|| default.to_owned())
+    };
     let b = |key: &str| profile.get(key).and_then(Value::as_bool).unwrap_or(false);
     let mut extra: Vec<String> = profile
         .get("_extra_args")
@@ -6899,6 +7399,13 @@ fn editor_settings_from_profile(profile: &serde_json::Map<String, Value>) -> Edi
         rope_base: s("rope-freq-base", ""),
         rope_scale: s("rope-freq-scale", ""),
         seed: s("seed", ""),
+        temperature: sv("temperature", ""),
+        top_k: sv("top-k", ""),
+        top_p: sv("top-p", ""),
+        min_p: sv("min-p", ""),
+        repeat_penalty: sv("repeat-penalty", ""),
+        presence_penalty: sv("presence-penalty", ""),
+        frequency_penalty: sv("frequency-penalty", ""),
         reasoning: s("reasoning", ""),
         jinja,
         chat_template: s("chat-template", ""),
@@ -6951,6 +7458,13 @@ fn editor_profile_from_profile(
         "rope-freq-base",
         "rope-freq-scale",
         "seed",
+        "temperature",
+        "top-k",
+        "top-p",
+        "min-p",
+        "repeat-penalty",
+        "presence-penalty",
+        "frequency-penalty",
         "reasoning",
         "jinja",
         "no-jinja",
@@ -7065,6 +7579,39 @@ fn editor_profile_from_profile(
     }
     if !settings.seed.is_empty() {
         profile.insert("seed".into(), Value::String(settings.seed.clone()));
+    }
+    if !settings.temperature.is_empty() {
+        profile.insert(
+            "temperature".into(),
+            Value::String(settings.temperature.clone()),
+        );
+    }
+    if !settings.top_k.is_empty() {
+        profile.insert("top-k".into(), Value::String(settings.top_k.clone()));
+    }
+    if !settings.top_p.is_empty() {
+        profile.insert("top-p".into(), Value::String(settings.top_p.clone()));
+    }
+    if !settings.min_p.is_empty() {
+        profile.insert("min-p".into(), Value::String(settings.min_p.clone()));
+    }
+    if !settings.repeat_penalty.is_empty() {
+        profile.insert(
+            "repeat-penalty".into(),
+            Value::String(settings.repeat_penalty.clone()),
+        );
+    }
+    if !settings.presence_penalty.is_empty() {
+        profile.insert(
+            "presence-penalty".into(),
+            Value::String(settings.presence_penalty.clone()),
+        );
+    }
+    if !settings.frequency_penalty.is_empty() {
+        profile.insert(
+            "frequency-penalty".into(),
+            Value::String(settings.frequency_penalty.clone()),
+        );
     }
     if settings.jinja {
         profile.insert("jinja".into(), Value::Bool(true));
@@ -7195,13 +7742,17 @@ fn profile_page(frame: &mut ratatui::Frame, app: &App, area: Rect) {
                     })
                     .unwrap_or(app.cfg.ctx_size);
                 cells.push(Line::raw(context.to_string()));
-                for case_name in ["small", "medium", "long"] {
+                for case_name in ["prefill-short", "prefill-medium", "prefill-long"] {
                     let case =
                         latest.and_then(|run| run.cases.iter().find(|case| case.name == case_name));
                     cells.push(benchmark_metric_cell(
                         case.map(|case| case.prompt_tokens_per_second),
                         Color::Yellow,
                     ));
+                }
+                for case_name in ["coding-single", "prose-en-single"] {
+                    let case =
+                        latest.and_then(|run| run.cases.iter().find(|case| case.name == case_name));
                     cells.push(benchmark_metric_cell(
                         case.map(|case| case.decode_median_tokens_per_second),
                         Color::Green,
@@ -7220,7 +7771,7 @@ fn profile_page(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let (headers, widths) = if wide {
         (
             vec![
-                "PROFILE", "VRAM", "RAM", "CTX", "PP-S", "T/S-S", "PP-M", "T/S-M", "PP-L", "T/S-L",
+                "PROFILE", "VRAM", "RAM", "CTX", "PP-S", "PP-M", "PP-L", "COD", "PROSE",
                 "LIVE T/S",
             ],
             vec![
@@ -7228,7 +7779,6 @@ fn profile_page(frame: &mut ratatui::Frame, app: &App, area: Rect) {
                 Constraint::Length(8),
                 Constraint::Length(8),
                 Constraint::Length(9),
-                Constraint::Length(7),
                 Constraint::Length(7),
                 Constraint::Length(7),
                 Constraint::Length(7),
@@ -8194,7 +8744,7 @@ mod rename_editing_tests {
     #[test]
     fn editing_supports_arrows_home_end_and_insert_at_cursor() {
         let mut app = app();
-        app.page = 3;
+        app.page = 2;
         app.selected = 0;
         app.start_profile_rename();
         let original = app.rename_input.as_ref().unwrap().original.clone();
@@ -8235,7 +8785,7 @@ mod rename_editing_tests {
     #[test]
     fn ctrl_edits_delete_word_line_and_jump_words() {
         let mut app = app();
-        app.page = 3;
+        app.page = 2;
         app.selected = 0;
         app.start_profile_rename();
         let state = app.rename_input.as_ref().unwrap().clone();
@@ -8385,5 +8935,42 @@ mod profile_editor_tests {
         let settings = editor_settings_from_profile(&profile);
         assert_eq!(settings.ctx, 262144);
         assert_eq!(settings.batch, 2048);
+    }
+}
+
+#[cfg(test)]
+mod compact_render_tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    fn app() -> App<'static> {
+        let paths = Paths::discover().expect("paths");
+        let cfg = Config::load(&paths).expect("config");
+        let paths: &'static Paths = Box::leak(Box::new(paths));
+        App::new(cfg, paths).expect("app")
+    }
+
+    fn render(width: u16, height: u16, app: &mut App) {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let _ = terminal.draw(|frame| draw(frame, app));
+    }
+
+    #[test]
+    fn compact_layout_renders_on_narrow_phone() {
+        let mut app = app();
+        render(40, 20, &mut app);
+    }
+
+    #[test]
+    fn compact_layout_renders_at_minimum_size() {
+        let mut app = app();
+        render(24, 8, &mut app);
+    }
+
+    #[test]
+    fn desktop_layout_renders_at_full_width() {
+        let mut app = app();
+        render(80, 24, &mut app);
     }
 }

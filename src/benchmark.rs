@@ -26,8 +26,24 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const OUTPUT_TOKENS: u64 = 256;
-const CASES: [(&str, f64); 3] = [("small", 0.05), ("medium", 0.25), ("long", 0.75)];
+const MAX_GENERATION_TOKENS: u64 = 700;
+const CODING_TOKENS: u64 = 512;
+const PROSE_TOKENS: u64 = 700;
+
+// Prefill-only cases: measure prompt processing throughput without generating anything.
+pub const PREFILL_CASES: [(&str, f64); 3] = [
+    ("prefill-short", 0.05),
+    ("prefill-medium", 0.25),
+    ("prefill-long", 0.75),
+];
+
+// Generation tiers. Coding + Prose (500-word story, then Chinese translation).
+// Each generation kind is measured twice: single-stream and max-resident-slot.
+pub const TOTAL_CASES: usize = PREFILL_CASES.len() + 3 * 2;
+
+const CODING_PROMPT: &str = "Write a complete, correct Python module implementing a Red-Black tree with insert, delete, and search. Include left/right rotation helpers, docstrings with type hints, and a self-test under `if __name__ == '__main__':` that inserts, searches, and deletes several values and prints the inorder traversal. The code must run as-is.";
+const PROSE_EN_PROMPT: &str = "Write a 500-word short story in English about a lighthouse keeper who finds a message in a bottle that changes everything. Use vivid sensory imagery and give it a clear beginning, middle, and end.";
+const PROSE_ZH_PREFIX: &str = "Translate the following English short story into natural, fluent Simplified Chinese. Preserve tone, imagery, and paragraph breaks:\n\n";
 const CANCEL_TERM_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -57,6 +73,10 @@ pub struct BenchmarkRun {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkCase {
     pub name: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub concurrency: u64,
     pub target_prompt_tokens: u64,
     pub actual_prompt_tokens: u64,
     pub actual_decode_tokens: u64,
@@ -142,22 +162,6 @@ impl ProfileBenchmarks {
     }
 }
 
-pub fn run(
-    cfg: &Config,
-    paths: &Paths,
-    profiles: &Profiles,
-    profile: &str,
-) -> Result<BenchmarkRun> {
-    run_inner(
-        cfg,
-        paths,
-        profiles,
-        profile,
-        Arc::new(AtomicBool::new(false)),
-        None,
-    )
-}
-
 pub fn run_cancellable_with_progress(
     cfg: &Config,
     paths: &Paths,
@@ -166,7 +170,26 @@ pub fn run_cancellable_with_progress(
     cancelled: Arc<AtomicBool>,
     progress: Sender<BenchmarkProgress>,
 ) -> Result<BenchmarkRun> {
-    run_inner(cfg, paths, profiles, profile, cancelled, Some(progress))
+    run_inner(
+        cfg,
+        paths,
+        profiles,
+        profile,
+        cancelled,
+        Some(progress),
+        TOTAL_CASES,
+    )
+}
+
+pub fn run_partial(
+    cfg: &Config,
+    paths: &Paths,
+    profiles: &Profiles,
+    profile: &str,
+    cancelled: Arc<AtomicBool>,
+    max_cases: usize,
+) -> Result<BenchmarkRun> {
+    run_inner(cfg, paths, profiles, profile, cancelled, None, max_cases)
 }
 
 fn run_inner(
@@ -176,6 +199,7 @@ fn run_inner(
     profile: &str,
     cancelled: Arc<AtomicBool>,
     progress: Option<Sender<BenchmarkProgress>>,
+    max_cases: usize,
 ) -> Result<BenchmarkRun> {
     emit(&progress, BenchmarkProgress::Preparing);
     if cancelled.load(Ordering::Relaxed) {
@@ -199,7 +223,7 @@ fn run_inner(
     let effective_context = models::context_limit(&model_path)
         .map(|limit| configured_context.min(limit))
         .unwrap_or(configured_context);
-    if effective_context <= OUTPUT_TOKENS + 32 {
+    if effective_context <= MAX_GENERATION_TOKENS + 32 {
         bail!("effective context {effective_context} is too small to benchmark")
     }
 
@@ -287,7 +311,7 @@ fn run_inner(
         wait_ready(&client, &base, &mut child, &cancelled)?;
         let load_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
         let effective_context = runtime_context(&client, &base).unwrap_or(effective_context);
-        if effective_context <= OUTPUT_TOKENS + 32 {
+        if effective_context <= MAX_GENERATION_TOKENS + 32 {
             bail!("runtime context {effective_context} is too small to benchmark")
         }
         emit(
@@ -302,7 +326,7 @@ fn run_inner(
         if seed_tokens.is_empty() {
             bail!("runtime tokenizer returned no tokens")
         }
-        let available = effective_context.saturating_sub(OUTPUT_TOKENS + 16);
+        let available = effective_context.saturating_sub(32);
         let profile_hash = format!(
             "{:x}",
             Sha256::digest(serde_json::to_vec(profile_value).unwrap_or_default())
@@ -321,12 +345,19 @@ fn run_inner(
             runtime_version: runtime_version(paths),
             backend: cfg.backend.clone(),
             effective_context,
-            output_tokens: OUTPUT_TOKENS,
+            output_tokens: MAX_GENERATION_TOKENS,
             load_ms,
             effective_args,
-            cases: Vec::with_capacity(CASES.len()),
+            cases: Vec::with_capacity(TOTAL_CASES),
         });
-        for (index, (name, fraction)) in CASES.into_iter().enumerate() {
+        let slots = runtime_slots(&client, &base).unwrap_or(1).max(1);
+        let mut next = 0usize;
+
+        // Prefill-only: prompt processing throughput, no generation.
+        for (name, fraction) in PREFILL_CASES.into_iter() {
+            if next >= max_cases {
+                break;
+            }
             if cancelled.load(Ordering::Relaxed) {
                 bail!("benchmark cancelled")
             }
@@ -335,7 +366,7 @@ fn run_inner(
             let mut case_seed = seed_tokens.clone();
             if !case_seed.is_empty() {
                 let length = case_seed.len();
-                case_seed.rotate_left((index * 7) % length);
+                case_seed.rotate_left((next * 7) % length);
             }
             let prompt = repeated_prompt(&case_seed, target as usize);
             emit(
@@ -346,7 +377,189 @@ fn run_inner(
                     started_at: Instant::now(),
                 },
             );
-            let case = run_case(&client, &base, name, target, prompt, child_id)?;
+            let case = run_prefill(&client, &base, name, target, prompt, child_id)?;
+            emit(&progress, BenchmarkProgress::CaseCompleted(case.clone()));
+            partial_run
+                .as_mut()
+                .expect("benchmark run metadata initialized")
+                .cases
+                .push(case);
+            next += 1;
+        }
+
+        // Coding tier: single-stream, then maximum-resident-slot throughput.
+        for (name, concurrency) in [("coding-single", 1u64), ("coding-slots", slots)] {
+            if next >= max_cases {
+                break;
+            }
+            if cancelled.load(Ordering::Relaxed) {
+                bail!("benchmark cancelled")
+            }
+            emit(
+                &progress,
+                BenchmarkProgress::CaseStarted {
+                    name: name.to_owned(),
+                    target_prompt_tokens: 0,
+                    started_at: Instant::now(),
+                },
+            );
+            let case = if concurrency == 1 {
+                run_generation(
+                    &client,
+                    &base,
+                    name,
+                    "coding",
+                    CODING_PROMPT.to_owned(),
+                    CODING_TOKENS,
+                    child_id,
+                )?
+                .0
+            } else {
+                run_generation_multi(
+                    &client,
+                    &base,
+                    name,
+                    "coding",
+                    vec![CODING_PROMPT.to_owned(); concurrency as usize],
+                    CODING_TOKENS,
+                    concurrency,
+                    child_id,
+                )?
+                .0
+            };
+            emit(&progress, BenchmarkProgress::CaseCompleted(case.clone()));
+            partial_run
+                .as_mut()
+                .expect("benchmark run metadata initialized")
+                .cases
+                .push(case);
+            next += 1;
+        }
+
+        // Prose tier: generate a 500-word story, then translate it into Chinese.
+        let mut story_single = String::new();
+        let mut stories_slots: Vec<String> = Vec::new();
+
+        if next < max_cases {
+            if cancelled.load(Ordering::Relaxed) {
+                bail!("benchmark cancelled")
+            }
+            emit(
+                &progress,
+                BenchmarkProgress::CaseStarted {
+                    name: "prose-en-single".to_owned(),
+                    target_prompt_tokens: 0,
+                    started_at: Instant::now(),
+                },
+            );
+            let (case, story) = run_generation(
+                &client,
+                &base,
+                "prose-en-single",
+                "prose",
+                PROSE_EN_PROMPT.to_owned(),
+                PROSE_TOKENS,
+                child_id,
+            )?;
+            story_single = story;
+            emit(&progress, BenchmarkProgress::CaseCompleted(case.clone()));
+            partial_run
+                .as_mut()
+                .expect("benchmark run metadata initialized")
+                .cases
+                .push(case);
+            next += 1;
+        }
+
+        if next < max_cases && slots > 1 {
+            if cancelled.load(Ordering::Relaxed) {
+                bail!("benchmark cancelled")
+            }
+            emit(
+                &progress,
+                BenchmarkProgress::CaseStarted {
+                    name: "prose-en-slots".to_owned(),
+                    target_prompt_tokens: 0,
+                    started_at: Instant::now(),
+                },
+            );
+            let (case, stories) = run_generation_multi(
+                &client,
+                &base,
+                "prose-en-slots",
+                "prose",
+                vec![PROSE_EN_PROMPT.to_owned(); slots as usize],
+                PROSE_TOKENS,
+                slots,
+                child_id,
+            )?;
+            stories_slots = stories;
+            emit(&progress, BenchmarkProgress::CaseCompleted(case.clone()));
+            partial_run
+                .as_mut()
+                .expect("benchmark run metadata initialized")
+                .cases
+                .push(case);
+            next += 1;
+        }
+
+        if next < max_cases {
+            if cancelled.load(Ordering::Relaxed) {
+                bail!("benchmark cancelled")
+            }
+            let zh_prompt = format!("{PROSE_ZH_PREFIX}{story_single}");
+            emit(
+                &progress,
+                BenchmarkProgress::CaseStarted {
+                    name: "prose-zh-single".to_owned(),
+                    target_prompt_tokens: 0,
+                    started_at: Instant::now(),
+                },
+            );
+            let (case, _) = run_generation(
+                &client,
+                &base,
+                "prose-zh-single",
+                "prose",
+                zh_prompt,
+                PROSE_TOKENS,
+                child_id,
+            )?;
+            emit(&progress, BenchmarkProgress::CaseCompleted(case.clone()));
+            partial_run
+                .as_mut()
+                .expect("benchmark run metadata initialized")
+                .cases
+                .push(case);
+            next += 1;
+        }
+
+        if next < max_cases && slots > 1 {
+            if cancelled.load(Ordering::Relaxed) {
+                bail!("benchmark cancelled")
+            }
+            let zh_prompts = stories_slots
+                .iter()
+                .map(|story| format!("{PROSE_ZH_PREFIX}{story}"))
+                .collect::<Vec<_>>();
+            emit(
+                &progress,
+                BenchmarkProgress::CaseStarted {
+                    name: "prose-zh-slots".to_owned(),
+                    target_prompt_tokens: 0,
+                    started_at: Instant::now(),
+                },
+            );
+            let (case, _) = run_generation_multi(
+                &client,
+                &base,
+                "prose-zh-slots",
+                "prose",
+                zh_prompts,
+                PROSE_TOKENS,
+                slots,
+                child_id,
+            )?;
             emit(&progress, BenchmarkProgress::CaseCompleted(case.clone()));
             partial_run
                 .as_mut()
@@ -397,19 +610,24 @@ pub fn summary(run: &BenchmarkRun) -> String {
         .cases
         .iter()
         .map(|case| {
-            format!(
-                "{} pp {:.1} - dec {:.1} - peak {:.1} - median {:.1} - first {:.2}s",
-                case.name,
-                case.prompt_tokens_per_second,
-                case.decode_tokens_per_second,
-                case.decode_peak_tokens_per_second,
-                case.decode_median_tokens_per_second,
-                case.time_to_first_response_ms / 1000.0,
-            )
+            if case.kind == "prefill" {
+                format!(
+                    "{} pp {:.1} ({:.0} tok)",
+                    case.name, case.prompt_tokens_per_second, case.actual_prompt_tokens as f64
+                )
+            } else {
+                format!(
+                    "{} x{} dec {:.1} - median {:.1}",
+                    case.name,
+                    case.concurrency,
+                    case.decode_tokens_per_second,
+                    case.decode_median_tokens_per_second
+                )
+            }
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let status = if run.cases.len() < CASES.len() {
+    let status = if run.cases.len() < TOTAL_CASES {
         " - partial"
     } else {
         ""
@@ -424,7 +642,7 @@ pub fn summary(run: &BenchmarkRun) -> String {
     )
 }
 
-fn run_case(
+fn run_prefill(
     client: &Client,
     base: &str,
     name: &str,
@@ -433,12 +651,71 @@ fn run_case(
     runtime_pid: u32,
 ) -> Result<BenchmarkCase> {
     let sampler = MemorySampler::start(runtime_pid);
+    let response: Value = client
+        .post(format!("{base}/completion"))
+        .json(&json!({
+            "prompt": prompt,
+            "n_predict": 0,
+            "temperature": 0.0,
+            "seed": 1,
+            "cache_prompt": false,
+            "stream": false
+        }))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    let (peak_vram_bytes, peak_ram_bytes) = sampler.stop();
+
+    let timings = response.get("timings").cloned().unwrap_or_else(|| Value::Null);
+    let actual_prompt = timings
+        .get("prompt_n")
+        .and_then(Value::as_u64)
+        .unwrap_or(target);
+    let prompt_ms = timings
+        .get("prompt_ms")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let pp = timings
+        .get("prompt_per_second")
+        .and_then(Value::as_f64)
+        .unwrap_or_else(|| rate(actual_prompt, prompt_ms));
+    Ok(BenchmarkCase {
+        name: name.to_owned(),
+        kind: "prefill".to_owned(),
+        concurrency: 1,
+        target_prompt_tokens: target,
+        actual_prompt_tokens: actual_prompt,
+        actual_decode_tokens: 0,
+        cached_prompt_tokens: 0,
+        prompt_ms,
+        prompt_tokens_per_second: pp,
+        decode_ms: 0.0,
+        decode_tokens_per_second: 0.0,
+        decode_peak_tokens_per_second: 0.0,
+        decode_median_tokens_per_second: 0.0,
+        time_to_first_response_ms: prompt_ms,
+        peak_vram_bytes,
+        peak_ram_bytes,
+        token_arrival_ms: Vec::new(),
+    })
+}
+
+fn run_generation(
+    client: &Client,
+    base: &str,
+    name: &str,
+    kind: &str,
+    prompt: String,
+    n_predict: u64,
+    runtime_pid: u32,
+) -> Result<(BenchmarkCase, String)> {
+    let sampler = MemorySampler::start(runtime_pid);
     let request_started = Instant::now();
     let mut response = client
         .post(format!("{base}/completion"))
         .json(&json!({
             "prompt": prompt,
-            "n_predict": OUTPUT_TOKENS,
+            "n_predict": n_predict,
             "temperature": 0.0,
             "seed": 1,
             "stream": true,
@@ -448,13 +725,15 @@ fn run_case(
         }))
         .send()?
         .error_for_status()?;
-    let mut arrivals = Vec::with_capacity(OUTPUT_TOKENS as usize);
+    let mut arrivals = Vec::with_capacity(n_predict as usize);
     let mut final_event = Value::Null;
+    let mut content = String::new();
     read_completion_stream(
         &mut response,
         request_started,
         &mut arrivals,
         &mut final_event,
+        &mut content,
     )?;
     let (peak_vram_bytes, peak_ram_bytes) = sampler.stop();
 
@@ -463,7 +742,7 @@ fn run_case(
         .get("prompt_n")
         .and_then(Value::as_u64)
         .or_else(|| final_event.get("tokens_evaluated").and_then(Value::as_u64))
-        .unwrap_or(target);
+        .unwrap_or(0);
     let actual_decode = timings
         .get("predicted_n")
         .and_then(Value::as_u64)
@@ -490,9 +769,11 @@ fn run_case(
         .unwrap_or_else(|| rate(actual_decode, decode_ms));
     let first = arrivals.first().copied().unwrap_or_default();
     let (decode_peak, decode_median) = decode_distribution(&arrivals);
-    Ok(BenchmarkCase {
+    let case = BenchmarkCase {
         name: name.to_owned(),
-        target_prompt_tokens: target,
+        kind: kind.to_owned(),
+        concurrency: 1,
+        target_prompt_tokens: 0,
         actual_prompt_tokens: actual_prompt,
         actual_decode_tokens: actual_decode,
         cached_prompt_tokens,
@@ -506,7 +787,94 @@ fn run_case(
         peak_vram_bytes,
         peak_ram_bytes,
         token_arrival_ms: arrivals,
-    })
+    };
+    Ok((case, content))
+}
+
+fn run_generation_multi(
+    client: &Client,
+    base: &str,
+    name: &str,
+    kind: &str,
+    prompts: Vec<String>,
+    n_predict: u64,
+    concurrency: u64,
+    runtime_pid: u32,
+) -> Result<(BenchmarkCase, Vec<String>)> {
+    let sampler = MemorySampler::start(runtime_pid);
+    let started = Instant::now();
+    let handles: Vec<_> = prompts
+        .into_iter()
+        .enumerate()
+        .map(|(seed, prompt)| {
+            let client = client.clone();
+            let base = base.to_string();
+            thread::spawn(move || -> Result<(u64, u64, String)> {
+                let response: Value = client
+                    .post(format!("{base}/completion"))
+                    .json(&json!({
+                        "prompt": prompt,
+                        "n_predict": n_predict,
+                        "temperature": 0.0,
+                        "seed": seed as u64,
+                        "cache_prompt": false,
+                        "stream": false
+                    }))
+                    .send()?
+                    .error_for_status()?
+                    .json()?;
+                let timings = response.get("timings").cloned().unwrap_or_default();
+                let prompt_n = timings.get("prompt_n").and_then(Value::as_u64).unwrap_or(0);
+                let decode_n = timings
+                    .get("predicted_n")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let content = response
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                Ok((prompt_n, decode_n, content))
+            })
+        })
+        .collect();
+
+    let mut prompt_tokens = 0u64;
+    let mut decode_tokens = 0u64;
+    let mut contents = Vec::with_capacity(concurrency as usize);
+    for handle in handles {
+        match handle.join() {
+            Ok(Ok((prompt_n, decode_n, content))) => {
+                prompt_tokens += prompt_n;
+                decode_tokens += decode_n;
+                contents.push(content);
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(_) => bail!("benchmark worker thread panicked"),
+        }
+    }
+    let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let (peak_vram_bytes, peak_ram_bytes) = sampler.stop();
+    let case = BenchmarkCase {
+        name: name.to_owned(),
+        kind: kind.to_owned(),
+        concurrency,
+        target_prompt_tokens: 0,
+        actual_prompt_tokens: prompt_tokens,
+        actual_decode_tokens: decode_tokens,
+        cached_prompt_tokens: 0,
+        prompt_ms: wall_ms,
+        prompt_tokens_per_second: rate(prompt_tokens, wall_ms),
+        decode_ms: wall_ms,
+        decode_tokens_per_second: rate(decode_tokens, wall_ms),
+        decode_peak_tokens_per_second: 0.0,
+        decode_median_tokens_per_second: 0.0,
+        time_to_first_response_ms: 0.0,
+        peak_vram_bytes,
+        peak_ram_bytes,
+        token_arrival_ms: Vec::new(),
+    };
+    Ok((case, contents))
 }
 
 fn read_completion_stream(
@@ -514,6 +882,7 @@ fn read_completion_stream(
     started: Instant,
     arrivals: &mut Vec<f64>,
     final_event: &mut Value,
+    content: &mut String,
 ) -> Result<()> {
     for line in BufReader::new(response).lines() {
         let line = line?;
@@ -525,6 +894,9 @@ fn read_completion_stream(
             continue;
         }
         let event: Value = serde_json::from_str(data)?;
+        if let Some(text) = event.get("content").and_then(Value::as_str) {
+            content.push_str(text);
+        }
         let token_count = event
             .get("tokens")
             .and_then(Value::as_array)
@@ -562,6 +934,16 @@ fn runtime_context(client: &Client, base: &str) -> Option<u64> {
         .get("default_generation_settings")?
         .get("n_ctx")?
         .as_u64()
+}
+
+fn runtime_slots(client: &Client, base: &str) -> Option<u64> {
+    let props = client
+        .get(format!("{base}/props"))
+        .send()
+        .ok()?
+        .json::<Value>()
+        .ok()?;
+    props.get("total_slots")?.as_u64()
 }
 
 fn tokenize(client: &Client, base: &str) -> Result<Vec<i64>> {
@@ -841,7 +1223,7 @@ mod tests {
                     runtime_version: String::new(),
                     backend: String::new(),
                     effective_context: 4096,
-                    output_tokens: OUTPUT_TOKENS,
+                    output_tokens: MAX_GENERATION_TOKENS,
                     load_ms: 0,
                     effective_args: vec![],
                     cases: vec![],

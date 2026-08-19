@@ -578,7 +578,7 @@ pub fn write_swap_config(cfg: &Config, paths: &Paths, profiles: &Profiles) -> Re
         text.push_str(&format!(
             "  {}:\n    cmd: {}\n    ttl: {ttl}\n",
             serde_json::to_string(&entry.id)?,
-            shell_join(&args),
+            yaml_quote(&shell_join(&args)),
         ));
     }
     let installed_vram = if cfg.scheduler_enabled || !cfg.scheduler_pinned_models.is_empty() {
@@ -850,6 +850,30 @@ fn shell_join(args: &[String]) -> String {
         .join(" ")
 }
 
+/// Quote `text` as a YAML double-quoted scalar.
+///
+/// The shell-joined `cmd` is embedded straight into the swap YAML, so it must
+/// be YAML-quoted. This matters for profiles that pass a multi-line chat
+/// template: a plain scalar cannot span lines, and a bare `#` or `: ` inside the
+/// command would otherwise be parsed as a comment or a mapping key.
+fn yaml_quote(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for ch in text.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
 pub fn swap_mode(paths: &Paths) -> bool {
     fs::read_to_string(&paths.launch)
         .ok()
@@ -1085,8 +1109,30 @@ fn upstream_log_from_events(events: &str, max_lines: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{maximal_fitting_sets, upstream_log_from_events};
+    use super::{maximal_fitting_sets, shell_join, upstream_log_from_events, yaml_quote};
     use crate::config::Config;
+
+    #[test]
+    fn yaml_quote_escapes_multiline_commands() {
+        let args = [
+            "--chat-template".to_owned(),
+            "{%- if a %}\n  {{- \"hi\" }}\n{%- endif %}".to_owned(),
+        ];
+        let cmd = shell_join(&args);
+        let quoted = yaml_quote(&cmd);
+        assert!(quoted.starts_with('"') && quoted.ends_with('"'));
+        let body = &quoted[1..quoted.len() - 1];
+        // Newlines must be emitted as \n escapes, never raw.
+        assert!(!body.contains('\n'));
+        assert!(body.contains("\\n"));
+        // Every double quote inside must be escaped as \".
+        for (i, ch) in body.char_indices() {
+            if ch == '"' {
+                assert!(i > 0 && body.as_bytes()[i - 1] == b'\\');
+            }
+        }
+        assert!(body.contains("\\\""));
+    }
 
     #[test]
     fn advertisement_defaults_to_assigned_base_models() {
