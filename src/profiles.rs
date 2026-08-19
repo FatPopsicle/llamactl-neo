@@ -110,7 +110,7 @@ impl Profiles {
             .get(name)
             .with_context(|| format!("unknown profile '{name}'"))?;
         let mut args = vec![];
-        // llama.cpp requires --jinja to precede arbitrary --chat-template values.
+
         for key in ["jinja", "no-jinja"] {
             if let Some(value) = p.get(key) {
                 append_flag(&mut args, key, value);

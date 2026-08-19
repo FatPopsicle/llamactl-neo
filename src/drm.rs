@@ -1,49 +1,23 @@
-//! GPU memory reporting via the DRM fdinfo interface.
-//!
-//! This is the only *cross-vendor* memory interface the kernel defines —
-//! `Documentation/gpu/drm-usage-stats.rst`. amdgpu additionally publishes
-//! `mem_info_vram_used` in sysfs, which is why AMD boxes can just cat a file,
-//! but i915 and xe publish no such thing and NVIDIA publishes neither. On an
-//! Intel Arc machine there is no card-wide VRAM counter anywhere: sysfs has
-//! none, the xe perf PMU exposes only engine ticks and clocks, and debugfs is
-//! unavailable inside an unprivileged container. Summing fdinfo is not a
-//! workaround there, it is the only option.
-//!
-//! The spec is deliberately *per client*: there is no card-wide line. The card
-//! total is the sum over clients, deduplicated by `(drm-pdev, drm-client-id)`
-//! because a single client normally holds the same buffers open on many fds —
-//! counting fds instead of clients inflates the total several-fold.
-//!
-//! Per-process attribution is the part vendor tools do not give you, and it is
-//! what makes a fit calculation honest: a card can be full of *another
-//! process's* model, and "free VRAM" alone cannot tell you whether that is
-//! something you may evict or something you must not touch.
+
+
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::Path;
 
-/// One DRM client's device-local memory footprint.
-///
-/// The per-client fields are not read by the telemetry card, which only needs the
-/// card-wide sum — but per-process attribution is the capability no vendor tool
-/// offers, and it is what a fit calculation needs to distinguish "the card is
-/// full" from "the card is full of another process's model". Kept as public API
-/// for that consumer rather than collected and thrown away.
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct DrmClient {
     pub pid: i32,
     pub comm: String,
-    /// PCI address, e.g. `0000:03:00.0`
+
     pub pdev: String,
-    /// `drm-total-*`: what this client has allocated in device-local memory.
-    /// This is the field nvtop reports, and it is the conservative one — an
-    /// allocation that is currently evicted can be paged straight back in, so a
-    /// fit calculation that ignores it will happily overcommit the card.
+
+
     pub allocated_bytes: u64,
-    /// `drm-resident-*`: the subset physically resident right now. Equal to
-    /// `allocated_bytes` on an idle machine, lower under memory pressure.
+
+
     pub resident_bytes: u64,
 }
 
@@ -54,19 +28,18 @@ pub struct DrmMemory {
 
 #[allow(dead_code)]
 impl DrmMemory {
-    /// Card-wide allocated bytes across every client on every device. Prefer
-    /// this for capacity decisions — see [`DrmClient::allocated_bytes`].
+
+
     pub fn total_allocated(&self) -> u64 {
         self.clients.iter().map(|c| c.allocated_bytes).sum()
     }
 
-    /// Card-wide resident bytes: what is physically on the card now. Not the
-    /// number to use when deciding whether another model fits.
+
     pub fn total_resident(&self) -> u64 {
         self.clients.iter().map(|c| c.resident_bytes).sum()
     }
 
-    /// Resident bytes per PCI device.
+
     pub fn per_device(&self) -> BTreeMap<String, u64> {
         let mut out = BTreeMap::new();
         for c in &self.clients {
@@ -75,7 +48,7 @@ impl DrmMemory {
         out
     }
 
-    /// Resident bytes for one process, across all devices.
+
     pub fn for_pid(&self, pid: i32) -> u64 {
         self.clients
             .iter()
@@ -85,7 +58,7 @@ impl DrmMemory {
     }
 }
 
-/// Parse a fdinfo size value: `"5546064 KiB"`, `"3 MiB"`, or a bare `"0"`.
+
 fn parse_size(value: &str) -> Option<u64> {
     let mut parts = value.split_whitespace();
     let n: u64 = parts.next()?.parse().ok()?;
@@ -95,19 +68,14 @@ fn parse_size(value: &str) -> Option<u64> {
         Some("KiB") => 1024,
         Some("MiB") => 1024 * 1024,
         Some("GiB") => 1024 * 1024 * 1024,
-        // Unknown suffix: refuse rather than silently reporting bytes and
-        // under-reporting by three orders of magnitude.
+
+
         Some(_) => return None,
     };
     Some(n * scale)
 }
 
-/// Sum the device-local regions of one fdinfo file.
-///
-/// Region naming is driver-specific — xe and amdgpu use `vram0`, i915 uses
-/// `local0`. Both are matched. `system` and `gtt` are deliberately excluded:
-/// they are host memory, and counting them as VRAM is how a tool ends up
-/// claiming a 16 GiB card is holding 40 GiB.
+
 fn device_local_bytes(fields: &BTreeMap<String, String>, prefix: &str) -> u64 {
     fields
         .iter()
@@ -130,11 +98,7 @@ fn read_fdinfo(path: &Path) -> Option<BTreeMap<String, String>> {
     Some(map)
 }
 
-/// Walk every process's DRM fds and collect device-local memory per client.
-///
-/// Processes we cannot read are skipped silently: without root this sees only
-/// our own clients, which yields a *lower bound* on card usage rather than an
-/// error. Callers that need the true card total must run privileged.
+
 pub fn read() -> DrmMemory {
     let mut out = DrmMemory::default();
     let mut seen: HashSet<(String, String)> = HashSet::new();
@@ -168,7 +132,7 @@ pub fn read() -> DrmMemory {
             else {
                 continue;
             };
-            // One client, many fds — count each client once.
+
             if !seen.insert((pdev.clone(), cid.clone())) {
                 continue;
             }
@@ -189,13 +153,7 @@ pub fn read() -> DrmMemory {
     out
 }
 
-/// Card-wide VRAM capacity, where the driver bothers to publish it.
-///
-/// amdgpu exposes `mem_info_vram_total` in sysfs. xe and i915 do not — but xe
-/// *does* publish capacity via `DRM_IOCTL_XE_DEVICE_QUERY` on the render node
-/// (`DRM_XE_MEM_REGION_CLASS_VRAM` -> `mr.total_size`), which is how nvtop gets
-/// it. That ioctl is not implemented here yet, so this returns 0 on Intel and
-/// the caller must source capacity elsewhere for now.
+
 pub fn device_total_bytes() -> u64 {
     let Ok(cards) = fs::read_dir("/sys/class/drm") else {
         return 0;
@@ -204,7 +162,7 @@ pub fn device_total_bytes() -> u64 {
     for card in cards.flatten() {
         let name = card.file_name();
         let Some(name) = name.to_str() else { continue };
-        // `card1` yes, `card1-DP-1` no — connectors are not devices.
+
         if !name.starts_with("card") || name.contains('-') {
             continue;
         }
@@ -216,10 +174,7 @@ pub fn device_total_bytes() -> u64 {
     total
 }
 
-/// GPU temperatures from the DRM devices' hwmon nodes.
-///
-/// Index is not fixed across drivers: xe starts at `temp2_input`, amdgpu at
-/// `temp1_input`, so probe a range rather than assuming.
+
 pub fn temperatures() -> Vec<f64> {
     let mut out = Vec::new();
     let Ok(cards) = fs::read_dir("/sys/class/drm") else {
@@ -242,7 +197,7 @@ pub fn temperatures() -> Vec<f64> {
                     && millidegrees > 0.0
                 {
                     out.push(millidegrees / 1000.0);
-                    break; // one reading per device is enough for a dashboard
+                    break;
                 }
             }
         }
@@ -260,7 +215,7 @@ mod tests {
         assert_eq!(parse_size("3 MiB"), Some(3 * 1024 * 1024));
         assert_eq!(parse_size("5546064 KiB"), Some(5546064 * 1024));
         assert_eq!(parse_size("nonsense"), None);
-        // An unrecognised suffix must not be treated as bytes.
+
         assert_eq!(parse_size("12 QiB"), None);
     }
 
@@ -270,7 +225,7 @@ mod tests {
         f.insert("drm-resident-system".into(), "0".into());
         f.insert("drm-resident-gtt".into(), "3 MiB".into());
         f.insert("drm-resident-vram0".into(), "5546064 KiB".into());
-        // gtt and system are host memory and must not count as VRAM.
+
         assert_eq!(device_local_bytes(&f, "drm-resident-"), 5546064 * 1024);
     }
 
@@ -279,7 +234,7 @@ mod tests {
         let mut f = BTreeMap::new();
         f.insert("drm-total-vram0".into(), "8 GiB".into());
         f.insert("drm-resident-vram0".into(), "5 GiB".into());
-        // Under eviction these diverge; nvtop reports the former.
+
         assert_eq!(device_local_bytes(&f, "drm-total-"), 8 * (1 << 30));
         assert_eq!(device_local_bytes(&f, "drm-resident-"), 5 * (1 << 30));
     }
@@ -296,8 +251,7 @@ mod tests {
 mod live {
     use super::*;
 
-    /// Manual smoke test — reads the real machine, so it is #[ignore]d.
-    /// `cargo test --release -- --ignored --nocapture drm::live`
+
     #[test]
     #[ignore]
     fn dump_live_readings() {

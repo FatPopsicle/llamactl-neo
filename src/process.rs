@@ -37,10 +37,8 @@ pub fn pid(paths: &Paths) -> Option<u32> {
 }
 
 pub(crate) fn runtime_command(binary: &Path, paths: &Paths) -> Command {
-    // A runtime that needs an environment script cannot simply be exec'd. Wrap
-    // it in a shell that sources the script first, then execs the binary so no
-    // extra process is left in the tree and signals/exit codes pass through
-    // unchanged. Arguments appended by callers land in "$@" after the shift.
+
+
     let env_file = Config::load(paths)
         .ok()
         .map(|cfg| cfg.runtime_env_file)
@@ -334,8 +332,8 @@ pub fn start(
     Ok(child.id())
 }
 pub fn stop(paths: &Paths) -> Result<bool> {
-    // A server launched by the user service must be stopped through systemd.
-    // Killing only its child makes Restart=on-failure immediately bring it back.
+
+
     let service_active = Command::new("systemctl")
         .args(["--user", "is-active", "--quiet", "llamactl.service"])
         .status()
@@ -765,20 +763,7 @@ fn append_scheduler_matrix(
     Ok(())
 }
 
-/// Total and free device memory, as reported by the runtime itself.
-///
-/// `llama-server --list-devices` prints `(TOTAL MiB, FREE MiB free)` from
-/// llama.cpp's common code, so the format is identical across CUDA, ROCm,
-/// Vulkan and SYCL. Both numbers are summed across devices.
-///
-/// This is the only usage source that works with *nothing loaded*: DRM fdinfo
-/// can only report clients that exist, so before the first model starts it
-/// legitimately reads zero — which is indistinguishable from "the card is
-/// empty" even when another process holds memory we cannot see.
-///
-/// ⚠️ `free` is backend-dependent and not directly comparable to fdinfo. On the
-/// same idle Arc B70 pair, SYCL reports the cards as entirely free while Vulkan
-/// reports ~3.2 GiB already in use. Treat it as a fallback, not a cross-check.
+
 pub fn device_memory_bytes() -> Option<(u64, u64)> {
     let paths = Paths::discover().ok()?;
     let binary = server_binary(&paths).unwrap_or_else(|| paths.current.join("llama-server"));
@@ -850,12 +835,7 @@ fn shell_join(args: &[String]) -> String {
         .join(" ")
 }
 
-/// Quote `text` as a YAML double-quoted scalar.
-///
-/// The shell-joined `cmd` is embedded straight into the swap YAML, so it must
-/// be YAML-quoted. This matters for profiles that pass a multi-line chat
-/// template: a plain scalar cannot span lines, and a bare `#` or `: ` inside the
-/// command would otherwise be parsed as a comment or a mapping key.
+
 fn yaml_quote(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
     out.push('"');
@@ -1122,10 +1102,10 @@ mod tests {
         let quoted = yaml_quote(&cmd);
         assert!(quoted.starts_with('"') && quoted.ends_with('"'));
         let body = &quoted[1..quoted.len() - 1];
-        // Newlines must be emitted as \n escapes, never raw.
+
         assert!(!body.contains('\n'));
         assert!(body.contains("\\n"));
-        // Every double quote inside must be escaped as \".
+
         for (i, ch) in body.char_indices() {
             if ch == '"' {
                 assert!(i > 0 && body.as_bytes()[i - 1] == b'\\');
@@ -1167,8 +1147,8 @@ mod tests {
 
 #[cfg(test)]
 mod capacity_live {
-    /// Manual check — runs the real runtime binary, so #[ignore]d.
-    /// `cargo test --release -- --ignored --nocapture capacity_live`
+
+
     #[test]
     #[ignore]
     fn reports_installed_vram() {

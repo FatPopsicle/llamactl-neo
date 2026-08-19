@@ -363,12 +363,11 @@ fn run() -> Result<()> {
             );
             let mut last_tenth = u64::MAX;
             let report = gguf::graft_mtp(&target_path, &donor_path, &output, |copied, total| {
-                if total > 0 {
-                    let tenth = copied * 10 / total;
-                    if tenth != last_tenth {
-                        eprintln!("  {}%", tenth * 10);
-                        last_tenth = tenth;
-                    }
+                if let Some(tenth) = copied.saturating_mul(10).checked_div(total)
+                    && tenth != last_tenth
+                {
+                    eprintln!("  {}%", tenth * 10);
+                    last_tenth = tenth;
                 }
             })?;
             println!(
@@ -550,8 +549,8 @@ fn retarget_profile(
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned);
         profile.insert("_model".into(), serde_json::Value::String(id.clone()));
-        // Internal MTP speculation only works when the target GGUF carries
-        // NextN tensors. Drop it rather than leave the profile unloadable.
+
+
         let mut removed_mtp = false;
         if profile.get("spec-type").and_then(serde_json::Value::as_str) == Some("draft-mtp")
             && !profile.contains_key("spec-draft-model")

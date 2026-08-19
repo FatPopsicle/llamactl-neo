@@ -69,8 +69,8 @@ pub fn model_bytes(path: &Path) -> u64 {
 }
 
 pub fn models_fingerprint(cfg: &Config) -> u64 {
-    // Order-independent aggregation avoids allocating and sorting one formatted
-    // string per model on every UI refresh.
+
+
     let mut fingerprint = 0u64;
     let mut count = 0u64;
     for root in &cfg.models_dirs {
@@ -295,8 +295,7 @@ type TensorInfo = (String, Option<usize>, u64);
 type TensorCache = HashMap<PathBuf, (Vec<FileStamp>, Vec<TensorInfo>)>;
 static TENSOR_CACHE: LazyLock<Mutex<TensorCache>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Bump when the persisted metadata schema changes so stale caches (which may
-/// lack fields such as `architecture`) are discarded and re-read from disk.
+
 const METADATA_CACHE_VERSION: u32 = 2;
 
 #[derive(Deserialize)]
@@ -361,7 +360,7 @@ fn persist_metadata_cache() {
     };
     let file = MetadataCacheFileRef {
         version: METADATA_CACHE_VERSION,
-        models: &*cache,
+        models: &cache,
     };
     if serde_json::to_writer(&mut temporary, &file).is_ok() {
         let _ = temporary.persist(path);
@@ -853,11 +852,9 @@ fn tensor_placement(
     })
 }
 
-/// Returns true when a hybrid SSM layer at `index` (0-based) keeps a
-/// context-sized KV cache: every `interval`-th regular layer is full
-/// attention, and trailing nextn/MTP blocks are always full attention.
+
 fn hybrid_layer_has_kv(index: u64, layers: u64, interval: u64, nextn: u64) -> bool {
-    index >= layers.saturating_sub(nextn) || (index + 1) % interval == 0
+    index >= layers.saturating_sub(nextn) || (index + 1).is_multiple_of(interval)
 }
 
 pub fn estimate(path: &Path, args: &[String]) -> Estimate {
@@ -886,10 +883,8 @@ pub fn estimate(path: &Path, args: &[String]) -> Estimate {
         .as_ref()
         .and_then(|item| item.block_count)
         .unwrap_or(1);
-    // The Qwen 3.5 family (qwen35 / qwen35moe) is hybrid SSM-attention: only
-    // every `full_attention_interval`-th layer (plus trailing nextn blocks)
-    // keeps a context-sized KV cache, while the SSM layers carry a constant
-    // recurrent state. Counting KV across every layer overestimates them ~4x.
+
+
     let architecture = metadata
         .as_ref()
         .map(|meta| meta.architecture.as_str())
@@ -1066,8 +1061,8 @@ pub fn estimate(path: &Path, args: &[String]) -> Estimate {
     let buffers = input_buf + compute_buf;
 
     let context_cal = if qwen35_hybrid {
-        // Hybrid KV head dims are exact in the GGUF; the dense-attention
-        // calibration factor does not apply.
+
+
         1.0
     } else if known_arch {
         1.0 / 2.2
@@ -1088,10 +1083,7 @@ pub fn estimate(path: &Path, args: &[String]) -> Estimate {
     let vram =
         ((gpu_weights + projector + draft) * 1.03 + (kv + buffers) * 1.03 * context_cal) as u64;
 
-    // RAM here means model data that must remain resident because it was not
-    // placed on the GPU. Do not add generic process overhead or mmap-backed
-    // GPU weights: a fully offloaded profile should correctly report zero
-    // estimated RAM spill.
+
     let ram_weights = (weights as f64 - gpu_weights).max(0.0);
     let ram_kv = (kv_full - kv).max(0.0);
     let cpu_layer_frac = if layers > 0 {
@@ -1111,8 +1103,8 @@ pub fn estimate_vram(path: &Path, args: &[String]) -> u64 {
 const DRAFT_ARCHITECTURES: [&str; 3] = ["dflash", "dspark", "eagle3"];
 
 fn architecture_and_block_count(path: &Path) -> Option<(String, Option<u64>)> {
-    // These keys are near the front of normal GGUF files. Stop as soon as both
-    // are known so library discovery does not parse enormous tokenizer arrays.
+
+
     let mut file = BufReader::with_capacity(64 * 1024, fs::File::open(path).ok()?);
     let mut magic = [0; 4];
     file.read_exact(&mut magic).ok()?;
@@ -1168,9 +1160,8 @@ fn draft_tokenizer_compatibility(
     main_vocab: &TokenizerMetadata,
     draft_vocab: &TokenizerMetadata,
 ) -> DraftCompatibility {
-    // llama.cpp only compares a special token ID when that token is configured
-    // to be added. GGUFs can legitimately use different EOS IDs while both
-    // have add_eos_token=false.
+
+
     for (name, main_add, draft_add, main_id, draft_id) in [
         (
             "BOS",
@@ -1276,10 +1267,8 @@ pub fn delete(cfg: &Config, id: &str) -> Result<Vec<PathBuf>> {
     }
     let mut files = parts(&model.path);
     if let Some(parent) = model.path.parent() {
-        // The mmproj projector in a directory is auto-attached to every main
-        // model resolved from it. Only remove it when the model being deleted
-        // is itself a main model and no other main model in that directory
-        // still needs it; drafts never own a projector.
+
+
         let sibling_main = all.iter().any(|m| {
             m.id != id && m.kind == ModelKind::Main && m.path.parent() == Some(parent)
         });
@@ -1357,9 +1346,8 @@ mod tests {
 
     #[test]
     fn hybrid_kv_only_counts_full_attention_layers() {
-        // Qwen 3.5 family: interval 4, 64 regular layers + 1 nextn (65 total).
-        // Full attention sits at 0-based indices 3, 7, ..., 63 (16 layers)
-        // plus the trailing nextn block 64.
+
+
         let full = (0..65)
             .filter(|index| hybrid_layer_has_kv(*index, 65, 4, 1))
             .count();

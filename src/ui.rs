@@ -46,7 +46,7 @@ const PAGES: &[&str] = &[
     "Maintenance",
 ];
 
-/// Short labels for the compact (phone/narrow) workspace switcher.
+
 const COMPACT_PAGE_LABELS: &[&str] = &[
     "Dash", "Model", "Prof", "Templ", "Search", "Set", "Logs", "Maint",
 ];
@@ -168,9 +168,7 @@ struct TemplatePicker {
     selected: usize,
 }
 
-/// Pseudo-option appended after the downloaded templates in the template
-/// picker. Selecting it clears the profile's chat-template override so the
-/// model's own built-in template is used again.
+
 const BUILT_IN_TEMPLATE_OPTION: &str = "built-in (model default)";
 
 struct BenchmarkView {
@@ -734,9 +732,7 @@ impl<'a> App<'a> {
         self.templates = templates::Templates::load(self.paths)
             .unwrap_or_else(|_| self.templates.clone());
 
-        // Start estimates before the recurring model scan. Previously the scan
-        // was started first and start_estimates() refused to run while it was
-        // active, permanently starving the Profiles table.
+
         let profile_fingerprint = self.estimates_fingerprint();
         if profile_fingerprint != self.profile_fingerprint {
             self.start_estimates(profile_fingerprint);
@@ -1109,9 +1105,8 @@ impl<'a> App<'a> {
         }
     }
     fn hf_destinations(&self) -> Vec<PathBuf> {
-        // Downloads always land in the llamactl-managed models folder. Other
-        // configured model directories (e.g. LM Studio) are only scanned for
-        // discovery and are never used as download targets.
+
+
         vec![self.paths.data_dir.join("models")]
     }
 
@@ -4281,8 +4276,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     }
 }
 
-/// Standard desktop layout: telemetry strip, fixed workspace sidebar, and a
-/// wide content pane. Unchanged from the original design.
+
 fn draw_full(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -4305,8 +4299,7 @@ fn draw_full(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     render_modals(frame, app, area);
 }
 
-/// Phone / narrow layout: a two-line telemetry summary, a compact two-row
-/// workspace switcher, and the full width handed to the active page.
+
 fn draw_compact(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
@@ -4390,7 +4383,7 @@ fn draw_workspace_sidebar(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     );
 }
 
-/// Two rows of four short tabs so the switcher stays compact on narrow phones.
+
 fn draw_workspace_tabs(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -4430,8 +4423,7 @@ fn draw_workspace_tabs(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     }
 }
 
-/// Two-line telemetry for narrow screens: memory/temps on one line, serving
-/// state on the next.
+
 fn draw_telemetry_compact(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let t = &app.telemetry;
     let gib = (1u64 << 30) as f64;
@@ -5450,9 +5442,7 @@ fn temperature_color(temperatures: &[f64]) -> Color {
     }
 }
 
-/// Cycles through each GPU so every device's temperature is shown instead of
-/// collapsing to the hottest. Single-GPU setups show a bare reading; multi-GPU
-/// setups rotate through `GPU i` every couple of seconds.
+
 fn rotating_gpu_temp(temperatures: &[f64], elapsed: Duration) -> (String, Color) {
     if temperatures.is_empty() {
         return ("—".into(), Color::DarkGray);
@@ -8159,9 +8149,8 @@ fn compute_profile_estimates(
     tx: &std::sync::mpsc::Sender<ProfileEstimateUpdate>,
 ) {
     let gib = (1u64 << 30) as f64;
-    // Tensor-placement overrides require scanning large tensor directories. Do
-    // the inexpensive profiles first and stream every result to the UI instead
-    // of withholding the whole table until the slowest model is finished.
+
+
     let mut names = profiles.profiles.keys().collect::<Vec<_>>();
     names.sort_by_key(|name| profiles.profiles[*name].contains_key("override-tensor"));
     for name in names {
@@ -8191,12 +8180,12 @@ fn compute_profile_estimates(
 }
 
 fn latest_gpu_samples(payload: &Value) -> Vec<&Value> {
-    // The llamactl sidecar already returns one current sample per device.
+
     if let Some(gpus) = payload.get("gpus").and_then(Value::as_array) {
         return gpus.iter().collect();
     }
-    // llama-swap's /api/performance response is a time series. Keep only the
-    // newest sample for each device instead of treating every sample as a GPU.
+
+
     let mut latest = BTreeMap::new();
     for sample in payload
         .get("gpu_stats")
@@ -8211,16 +8200,11 @@ fn latest_gpu_samples(payload: &Value) -> Vec<&Value> {
     latest.into_values().collect()
 }
 
-/// Runtime-reported (total, free) device memory, cached briefly.
-///
-/// Unlike capacity this genuinely changes, so it cannot be cached for the
-/// process lifetime — but it costs a subprocess, and telemetry is polled on a
-/// timer, so re-running it on every tick would fork `llama-server` several
-/// times a second. A few seconds of staleness is the right trade for a number
-/// that is only consulted while idle.
+
 fn runtime_device_memory() -> Option<(u64, u64)> {
     use std::sync::Mutex;
-    static CACHE: Mutex<Option<(std::time::Instant, Option<(u64, u64)>)>> = Mutex::new(None);
+    type CacheEntry = Option<(std::time::Instant, Option<(u64, u64)>)>;
+    static CACHE: Mutex<CacheEntry> = Mutex::new(None);
     const TTL: Duration = Duration::from_secs(5);
 
     let mut guard = CACHE.lock().ok()?;
@@ -8234,23 +8218,7 @@ fn runtime_device_memory() -> Option<(u64, u64)> {
     fresh
 }
 
-/// Card capacity in bytes, cached for the process lifetime.
-///
-/// fdinfo reports usage but never capacity — the DRM usage-stats interface has
-/// no such field. amdgpu publishes `mem_info_vram_total` in sysfs; xe and i915
-/// publish nothing equivalent, so on Intel we fall back to asking the runtime
-/// itself via `llama-server --list-devices`, whose `(TOTAL MiB, FREE MiB free)`
-/// format is emitted by llama.cpp's common code and is therefore identical
-/// across CUDA, ROCm, Vulkan and SYCL.
-///
-/// Cached because that fallback spawns a subprocess and telemetry is polled on
-/// a timer. Capacity is unlikely to change while a runtime is loaded — though
-/// it is not impossible: PCIe hotplug, SR-IOV VFs appearing or disappearing,
-/// and passthrough changes inside a container can all move it.
-///
-/// Note: It *is* backend-dependent, though: the same Arc B70 reports 32656 MiB
-/// under Vulkan and 31023 MiB under SYCL. Switching backend therefore needs a
-/// restart before the figure is right again.
+
 fn vram_capacity_bytes() -> u64 {
     static CAPACITY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *CAPACITY.get_or_init(|| {
@@ -8326,14 +8294,8 @@ fn system_telemetry(cfg: &Config, probe_api: bool) -> Telemetry {
             return telemetry;
         }
     }
-    // DRM fdinfo: the only cross-vendor memory interface in the kernel, and on
-    // Intel the only VRAM source that exists at all — sysfs publishes no counter,
-    // the xe PMU exposes engines and clocks only, and debugfs is unavailable in a
-    // container. Tried before nvidia-smi so non-NVIDIA hardware reports something
-    // instead of zero; on an NVIDIA box this yields nothing and we fall through.
 
-    // Tier 1 — DRM fdinfo. Exact, per-process, no subprocess, vendor-neutral.
-    // Only sees clients that exist, so it reads zero before anything is loaded.
+
     let drm = crate::drm::read();
     let drm_used = drm.total_allocated();
     if drm_used > 0 {
@@ -8343,9 +8305,7 @@ fn system_telemetry(cfg: &Config, probe_api: bool) -> Telemetry {
         return telemetry;
     }
 
-    // Tier 2 — ask the runtime. This is the idle case: nothing of ours is
-    // loaded, so fdinfo has nothing to report, but the card is not necessarily
-    // empty. The driver's own view is what a fit calculation needs here.
+
     if let Some((total, free)) = runtime_device_memory() {
         telemetry.vram_used += total.saturating_sub(free);
         telemetry.vram_total += total;
@@ -8353,7 +8313,7 @@ fn system_telemetry(cfg: &Config, probe_api: bool) -> Telemetry {
         return telemetry;
     }
 
-    // Tier 3 — nvidia-smi, below.
+
     if let Ok(output) = Command::new("nvidia-smi")
         .args([
             "--query-gpu=memory.used,memory.total,temperature.gpu",
@@ -8516,8 +8476,8 @@ fn serving_telemetry(cfg: &Config, paths: &Paths) -> Telemetry {
                 .and_then(Value::as_f64),
             duration_ms: last.get("duration_ms").and_then(Value::as_u64).unwrap_or(0),
         });
-        // llama-swap retains activity across model unloads and manager restarts.
-        // Keep the newest measured generation rate for every advertised model.
+
+
         for request in activity
             .get("data")
             .and_then(Value::as_array)

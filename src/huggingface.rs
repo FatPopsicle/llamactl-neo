@@ -1,11 +1,5 @@
-// Copyright 2025 HuggingFaceModelDownloader contributors
-// Copyright 2026 llamactl contributors
-// SPDX-License-Identifier: Apache-2.0
-//
-// Download planning and transfer behavior is adapted from
-// https://github.com/bodaay/HuggingFaceModelDownloader.
-// This file was substantially rewritten in Rust for llamactl and does not
-// depend on or vendor the upstream Go project.
+
+
 
 use anyhow::{Context, Result, anyhow, bail};
 use regex::Regex;
@@ -232,9 +226,7 @@ pub fn search(query: &str) -> Result<Vec<Repository>> {
     search_repos(query, Some("gguf"))
 }
 
-/// Search Hugging Face for repositories whose `tokenizer_config.json` carries a
-/// Jinja chat template. Each hit includes the full template text so it can be
-/// previewed and saved into the local template library.
+
 pub fn search_templates(query: &str) -> Result<Vec<TemplateHit>> {
     let repositories = search_repos(query, None)?;
     let mut hits = Vec::new();
@@ -297,8 +289,7 @@ fn search_repos(query: &str, filter: Option<&str>) -> Result<Vec<Repository>> {
 pub fn fetch_chat_template(repo: &str) -> Result<Option<String>> {
     validate_repo_id(repo)?;
 
-    // Template collections (e.g. MLX repos) expose the Jinja template in the
-    // model metadata rather than in a tokenizer config.
+
     let response = api_client()?
         .get(api_url(repo, &[])?)
         .send()
@@ -309,15 +300,14 @@ pub fn fetch_chat_template(repo: &str) -> Result<Option<String>> {
         .with_context(|| format!("decode model metadata for {repo}"))?;
     if let Some(config) = metadata.get("config") {
         for key in ["chat_template_jinja", "chat_template"] {
-            if let Some(template) = config.get(key).and_then(Value::as_str) {
-                if !template.trim().is_empty() {
+            if let Some(template) = config.get(key).and_then(Value::as_str)
+                && !template.trim().is_empty() {
                     return Ok(Some(template.to_owned()));
                 }
-            }
         }
     }
 
-    // Transformers repos keep the template in tokenizer_config.json instead.
+
     fetch_tokenizer_chat_template(repo)
 }
 
@@ -625,8 +615,8 @@ fn download_file(
             }
             Err(error) if cancel.load(Ordering::Relaxed) => return Err(error),
             Err(_) => {
-                // A full-size partial with the wrong LFS digest cannot be
-                // resumed safely. Discard it and fetch clean ranges below.
+
+
                 fs::remove_file(&partial)
                     .with_context(|| format!("remove corrupt {}", partial.display()))?;
                 for index in 0..CONNECTIONS_PER_FILE {

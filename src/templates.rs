@@ -4,23 +4,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 
-/// Named Jinja chat-template library.
-///
-/// Each template is stored as an individual `.jinja` file inside the dedicated
-/// templates directory (`~/.config/llamactl/templates`). A single file per
-/// template keeps them human-editable, diffable, and easy to back up.
+
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct Templates {
     pub templates: BTreeMap<String, String>,
 }
 
-impl Default for Templates {
-    fn default() -> Self {
-        Self {
-            templates: BTreeMap::new(),
-        }
-    }
-}
 
 impl Templates {
     pub fn load(paths: &Paths) -> Result<Self> {
@@ -80,8 +70,7 @@ fn template_path(paths: &Paths, name: &str) -> PathBuf {
     paths.templates.join(format!("{name}.jinja"))
 }
 
-/// One-time migration from the earlier `templates.json` storage into individual
-/// `.jinja` files. The legacy file is renamed away once consumed.
+
 fn migrate_legacy_json(paths: &Paths, templates: &mut BTreeMap<String, String>) -> Result<()> {
     let legacy = paths.templates.with_file_name("templates.json");
     if !legacy.is_file() {
@@ -92,12 +81,11 @@ fn migrate_legacy_json(paths: &Paths, templates: &mut BTreeMap<String, String>) 
         && let Some(map) = data.get("templates").and_then(serde_json::Value::as_object)
     {
         for (name, value) in map {
-            if let Some(content) = value.as_str() {
-                if !templates.contains_key(name) {
+            if let Some(content) = value.as_str()
+                && !templates.contains_key(name) {
                     let _ = fs::write(template_path(paths, name), content);
                     templates.insert(name.clone(), content.to_owned());
                 }
-            }
         }
     }
     let _ = fs::rename(&legacy, legacy.with_extension("json.migrated"));

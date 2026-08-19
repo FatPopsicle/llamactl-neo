@@ -1,8 +1,5 @@
-//! Minimal, lossless GGUF header reading/writing plus MTP grafting.
-//!
-//! The header parser keeps every metadata value as raw bytes so an untouched
-//! key round-trips byte-for-byte; only the keys the graft must change are
-//! substituted. Tensor data is streamed in bounded slices, never loaded whole.
+
+
 
 use anyhow::{Context, Result, bail};
 use std::{
@@ -66,9 +63,7 @@ fn read_string(r: &mut impl Read) -> Result<String> {
     Ok(String::from_utf8_lossy(&read_exact_n(r, len as usize)?).into_owned())
 }
 
-/// Read a full metadata value and return its exact on-disk encoding, so it can
-/// be written back verbatim. For strings this includes the length prefix; for
-/// arrays it includes the element type, count, and every element.
+
 fn capture_value(r: &mut impl Read, vt: u32) -> Result<Vec<u8>> {
     match vt {
         GGUF_STRING => {
@@ -264,8 +259,7 @@ pub struct GraftReport {
     pub output_bytes: u64,
 }
 
-/// Transplant the MTP block (`blk.N.*`) from `donor` into `target`, writing the
-/// mixed-quantization result to `output`.
+
 pub fn graft_mtp(
     target: &Path,
     donor: &Path,
@@ -324,8 +318,7 @@ pub fn graft_mtp(
         .map(|(x, s)| (x.name.as_str(), (d.data_start + x.offset, *s)))
         .collect();
 
-    // Metadata: everything from the target except the two keys the graft
-    // controls, then those two keys verbatim from the donor.
+
     let block_key = format!("{arch}.block_count");
     let nextn_key = format!("{arch}.nextn_predict_layers");
     let mut out_meta: Vec<MetaEntry> = t
@@ -343,7 +336,7 @@ pub fn graft_mtp(
         out_meta.push(m.clone());
     }
 
-    // Tensor list and output offsets.
+
     let mut out_tensors: Vec<(&TensorEntry, u64)> = Vec::with_capacity(t.tensors.len() + extra.len());
     for (x, size) in t.tensors.iter().zip(&t_sizes) {
         out_tensors.push((x, *size));
@@ -387,7 +380,7 @@ pub fn graft_mtp(
         w.write_all(&vec![0u8; pad as usize])?;
     }
 
-    // Stream-copy tensor data.
+
     let mut t_in = File::open(target)?;
     let mut d_in = File::open(donor)?;
     let mut copied = 0u64;
