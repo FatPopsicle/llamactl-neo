@@ -180,6 +180,10 @@ enum ProfileAction {
     },
     Load { name: String },
     Bind { name: String },
+    Runtime {
+        name: String,
+        runtime: Option<String>,
+    },
     Set {
         name: String,
         key: String,
@@ -578,11 +582,12 @@ fn profile_command(c: &Config, p: &Paths, a: Option<ProfileAction>) -> Result<()
     let mut refresh = false;
     match a {
         None => {
-            println!("  {:<30} OWNER", "PROFILE");
+            println!("  {:<30} {:<20} OWNER", "PROFILE", "RUNTIME");
             for name in profiles.profiles.keys() {
                 println!(
-                    "  {:<30} {}",
+                    "  {:<30} {:<20} {}",
                     name,
+                    profiles.runtime(name).unwrap_or("(settings)"),
                     profiles.owner(name).unwrap_or("unassigned")
                 )
             }
@@ -692,6 +697,30 @@ fn profile_command(c: &Config, p: &Paths, a: Option<ProfileAction>) -> Result<()
             profiles.save(p)?;
             refresh = true;
             println!("✓ bound {owner} → {name}");
+        }
+        Some(ProfileAction::Runtime { name, runtime }) => {
+            let profile = profiles
+                .profiles
+                .get_mut(&name)
+                .with_context(|| format!("unknown profile '{name}'"))?;
+            match runtime {
+                None => println!(
+                    "{name}: {}",
+                    profiles.runtime(&name).unwrap_or("(settings)")
+                ),
+                Some(runtime) if runtime.is_empty() => {
+                    profile.remove("_runtime");
+                    profiles.save(p)?;
+                    refresh = true;
+                    println!("✓ {name} now uses the runtime from settings");
+                }
+                Some(runtime) => {
+                    profile.insert("_runtime".into(), serde_json::Value::String(runtime.clone()));
+                    profiles.save(p)?;
+                    refresh = true;
+                    println!("✓ {name} pinned to runtime {runtime}");
+                }
+            }
         }
         Some(ProfileAction::Set { name, key, value }) => {
             let profile = profiles

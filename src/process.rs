@@ -37,8 +37,9 @@ pub fn pid(paths: &Paths) -> Option<u32> {
 }
 
 pub(crate) fn runtime_command(binary: &Path, paths: &Paths) -> Command {
-
-
+    runtime_command_for(binary, paths, None)
+}
+pub(crate) fn runtime_command_for(binary: &Path, paths: &Paths, server: Option<&Path>) -> Command {
     let env_file = Config::load(paths)
         .ok()
         .map(|cfg| cfg.runtime_env_file)
@@ -57,10 +58,17 @@ pub(crate) fn runtime_command(binary: &Path, paths: &Paths) -> Command {
         None => Command::new(binary),
     };
     let runtime_binary = if binary == paths.swap_bin || binary == Path::new("/usr/bin/env") {
-        server_binary(paths).unwrap_or_else(|| paths.current.join("llama-server"))
+        server
+            .map(Path::to_owned)
+            .or_else(|| server_binary(paths))
+            .unwrap_or_else(|| paths.current.join("llama-server"))
     } else {
         binary.to_owned()
     };
+    command.env("LD_LIBRARY_PATH", runtime_library_path(&runtime_binary, paths));
+    command
+}
+fn runtime_library_path(runtime_binary: &Path, paths: &Paths) -> std::ffi::OsString {
     let runtime = runtime_binary
         .parent()
         .and_then(|parent| parent.canonicalize().ok())
@@ -87,12 +95,15 @@ pub(crate) fn runtime_command(binary: &Path, paths: &Paths) -> Command {
         library_path.push(":");
         library_path.push(inherited);
     }
-    command.env("LD_LIBRARY_PATH", library_path);
-    command
+    library_path
 }
 pub fn server_binary(paths: &Paths) -> Option<PathBuf> {
+    server_binary_for(paths, None)
+}
+pub fn server_binary_for(paths: &Paths, runtime: Option<&str>) -> Option<PathBuf> {
     let cfg = Config::load(paths).ok();
-    if let Some(runtime) = cfg.as_ref().map(|config| config.runtime.as_str())
+    let runtime = runtime.or_else(|| cfg.as_ref().map(|config| config.runtime.as_str()));
+    if let Some(runtime) = runtime
         && runtime != "managed"
     {
         if let Some(name) = runtime.strip_prefix("managed:") {
@@ -186,14 +197,16 @@ pub fn build_command(
     profiles: &Profiles,
     model: Option<&str>,
     extra: &[String],
-) -> Result<(PathBuf, Vec<String>, bool)> {
+) -> Result<(PathBuf, PathBuf, Vec<String>, bool)> {
     if model.is_none() {
         if !paths.swap_bin.is_file() {
             bail!("llama-swap is not installed — run 'llamactl update'")
         }
         write_swap_config(cfg, paths, profiles)?;
+        let server = server_binary(paths).unwrap_or_else(|| paths.current.join("llama-server"));
         return Ok((
             paths.swap_bin.clone(),
+            server,
             vec![
                 "-config".into(),
                 paths.swap_config.display().to_string(),
@@ -204,8 +217,6 @@ pub fn build_command(
             true,
         ));
     }
-    let binary =
-        server_binary(paths).context("llama-server is not installed — run 'llamactl update'")?;
     let spec = model.unwrap();
     let (query, profile_name) = spec
         .split_once('@')
@@ -215,6 +226,12 @@ pub fn build_command(
     let query = profile_name
         .and_then(|p| profiles.owner(p))
         .unwrap_or(query);
+    let server = profile_name
+        .and_then(|p| profiles.runtime(p))
+        .and_then(|runtime| server_binary_for(paths, Some(runtime)))
+        .or_else(|| server_binary(paths))
+        .context("llama-server is not installed — run 'llamactl update'")?;
+    let binary = server.clone();
     let (mut args, main_path, id) = models::resolve(cfg, Some(query))?;
     args.extend(common_args(cfg));
     if let Some(profile) = profile_name {
@@ -243,10 +260,10 @@ pub fn build_command(
                 .collect::<Vec<_>>();
             wrapped.push(binary.display().to_string());
             wrapped.extend(args);
-            return Ok((PathBuf::from("/usr/bin/env"), wrapped, false));
+            return Ok((PathBuf::from("/usr/bin/env"), server, wrapped, false));
         }
     }
-    Ok((binary, args, false))
+    Ok((binary, server, args, false))
 }
 
 pub fn serve(
@@ -260,8 +277,8 @@ pub fn serve(
         bail!("server already running (pid {existing})")
     }
     fs::create_dir_all(&paths.state_dir)?;
-    let (binary, args, swap) = build_command(cfg, paths, profiles, model, extra)?;
-    let mut child = runtime_command(&binary, paths)
+    let (binary, server, args, swap) = build_command(cfg, paths, profiles, model, extra)?;
+    let mut child = runtime_command_for(&binary, paths, Some(&server))
         .args(&args)
         .process_group(0)
         .spawn()
@@ -297,13 +314,13 @@ pub fn start(
         bail!("server already running (pid {existing})")
     }
     fs::create_dir_all(&paths.state_dir)?;
-    let (binary, args, swap) = build_command(cfg, paths, profiles, model, extra)?;
+    let (binary, server, args, swap) = build_command(cfg, paths, profiles, model, extra)?;
     let log = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&paths.log)?;
     let err = log.try_clone()?;
-    let mut child = runtime_command(&binary, paths)
+    let mut child = runtime_command_for(&binary, paths, Some(&server))
         .args(&args)
         .stdin(Stdio::null())
         .stdout(log)
@@ -386,6 +403,7 @@ struct SwapEntry {
     id: String,
     physical: String,
     path: PathBuf,
+    binary: PathBuf,
     profile: Option<String>,
     overrides: serde_json::Map<String, serde_json::Value>,
     estimate: u64,
@@ -393,7 +411,7 @@ struct SwapEntry {
 }
 
 pub fn write_swap_config(cfg: &Config, paths: &Paths, profiles: &Profiles) -> Result<usize> {
-    let binary = server_binary(paths).context("llama-server is not installed")?;
+    let default_binary = server_binary(paths).context("llama-server is not installed")?;
     let known_flags = known_flags(paths);
     fs::create_dir_all(&paths.state_dir)?;
     let mut entries = vec![];
@@ -418,10 +436,16 @@ pub fn write_swap_config(cfg: &Config, paths: &Paths, profiles: &Profiles) -> Re
                 .map(|profile| profiles.environment(profile))
                 .transpose()?
                 .unwrap_or_default();
+            let binary = profile
+                .as_deref()
+                .and_then(|profile| profiles.runtime(profile))
+                .and_then(|runtime| server_binary_for(paths, Some(runtime)))
+                .unwrap_or_else(|| default_binary.clone());
             entries.push(SwapEntry {
                 id: model.id.clone(),
                 physical: model.id.clone(),
                 path: model.path.clone(),
+                binary,
                 profile,
                 overrides,
                 estimate: models::estimate_vram(&model.path, &estimate_args),
@@ -445,6 +469,8 @@ pub fn write_swap_config(cfg: &Config, paths: &Paths, profiles: &Profiles) -> Re
                         id: name.clone(),
                         physical: model.id.clone(),
                         path: model.path.clone(),
+                        binary: server_binary_for(paths, profiles.runtime(name))
+                            .unwrap_or_else(|| default_binary.clone()),
                         profile: Some(name.clone()),
                         overrides: serde_json::Map::new(),
                         estimate: {
@@ -504,7 +530,7 @@ pub fn write_swap_config(cfg: &Config, paths: &Paths, profiles: &Profiles) -> Re
     text.push_str("models:\n");
     let mut metadata = BTreeMap::new();
     for entry in &entries {
-        let mut args = vec![binary.display().to_string()];
+        let mut args = vec![entry.binary.display().to_string()];
         args.extend(models::model_args(&entry.path));
         args.extend(common_args(cfg));
         if let Some(profile) = &entry.profile {
@@ -552,17 +578,20 @@ pub fn write_swap_config(cfg: &Config, paths: &Paths, profiles: &Profiles) -> Re
         } else {
             cfg.swap_ttl
         };
-        if !entry.environment.is_empty() {
-            args.splice(
-                0..0,
-                std::iter::once("env".into()).chain(
-                    entry
-                        .environment
-                        .iter()
-                        .map(|(key, value)| format!("{key}={value}")),
-                ),
-            );
-        }
+        let mut env = vec![
+            "env".into(),
+            format!(
+                "LD_LIBRARY_PATH={}",
+                runtime_library_path(&entry.binary, paths).to_string_lossy()
+            ),
+        ];
+        env.extend(
+            entry
+                .environment
+                .iter()
+                .map(|(key, value)| format!("{key}={value}")),
+        );
+        args.splice(0..0, env);
         let ctx_size = flag_value_u64(&args, &["--ctx-size", "-c"]).unwrap_or(4096);
         let has_vision = args.iter().any(|a| a == "--mmproj");
         metadata.insert(
@@ -1161,6 +1190,60 @@ mod capacity_live {
             "installed_vram_bytes: {} bytes = {:.2} GiB",
             bytes,
             bytes as f64 / (1u64 << 30) as f64
+        );
+    }
+}
+
+#[cfg(test)]
+mod runtime_pin_tests {
+    use super::*;
+    use std::fs;
+
+    fn temp_paths() -> (tempfile::TempDir, Paths) {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        let data_dir = dir.path().join("data");
+        let state_dir = dir.path().join("state");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::create_dir_all(&state_dir).unwrap();
+        let paths = Paths {
+            config: config_dir.join("config.json"),
+            profiles: config_dir.join("profiles.json"),
+            versions: data_dir.join("versions"),
+            current: data_dir.join("current"),
+            pid: state_dir.join("server.pid"),
+            launch: state_dir.join("launch.json"),
+            log: state_dir.join("server.log"),
+            swap_bin: data_dir.join("llama-swap/llama-swap"),
+            swap_config: state_dir.join("llama-swap.yaml"),
+            metadata_cache: state_dir.join("gguf-metadata-cache.json"),
+            profile_benchmarks: state_dir.join("profile-benchmarks.json"),
+            templates: config_dir.join("templates"),
+            data_dir,
+            state_dir,
+        };
+        (dir, paths)
+    }
+
+    #[test]
+    fn pinned_runtime_resolves_and_blank_falls_back_to_settings() {
+        let (_dir, paths) = temp_paths();
+        fs::create_dir_all(&paths.versions).unwrap();
+        let pinned = paths.versions.join("pinned");
+        let settings = paths.versions.join("settings");
+        for v in [&pinned, &settings] {
+            fs::create_dir_all(v).unwrap();
+            fs::write(v.join("llama-server"), b"x").unwrap();
+        }
+        fs::write(&paths.config, r#"{"runtime":"managed:settings"}"#).unwrap();
+
+        assert_eq!(
+            server_binary_for(&paths, Some("managed:pinned")).unwrap(),
+            pinned.join("llama-server")
+        );
+        assert_eq!(
+            server_binary_for(&paths, None).unwrap(),
+            settings.join("llama-server")
         );
     }
 }

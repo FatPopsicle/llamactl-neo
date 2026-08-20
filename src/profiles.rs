@@ -157,6 +157,13 @@ impl Profiles {
     pub fn owner(&self, name: &str) -> Option<&str> {
         self.profiles.get(name)?.get("_model")?.as_str()
     }
+    pub fn runtime(&self, name: &str) -> Option<&str> {
+        self.profiles
+            .get(name)?
+            .get("_runtime")?
+            .as_str()
+            .filter(|runtime| !runtime.is_empty())
+    }
     pub fn binding(
         &self,
         model: &str,

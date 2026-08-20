@@ -16,6 +16,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{BufRead, BufReader},
     os::unix::process::CommandExt,
+    path::Path,
     process::{Command, Stdio},
     sync::{
         Arc,
@@ -226,11 +227,16 @@ fn run_inner(
 
     let mut bench_cfg = cfg.clone();
     bench_cfg.host = "127.0.0.1".into();
-    let (binary, args, swap) =
+    let (binary, server, args, swap) =
         process::build_command(&bench_cfg, paths, profiles, Some(profile), &[])?;
     if swap {
         bail!("profile benchmark unexpectedly resolved to llama-swap")
     }
+    let runtime_label = profiles
+        .runtime(profile)
+        .map(str::to_owned)
+        .unwrap_or_else(|| resolved_runtime(cfg, paths));
+    let runtime_version_label = runtime_version_for(&server, paths);
     let base = format!("http://127.0.0.1:{}", bench_cfg.port);
     let mut headers = HeaderMap::new();
     if let Some(key) = bench_cfg.keys().first() {
@@ -260,7 +266,7 @@ fn run_inner(
     }
     emit(&progress, BenchmarkProgress::LoadingRuntime);
     let started = Instant::now();
-    let child_result = process::runtime_command(&binary, paths)
+    let child_result = process::runtime_command_for(&binary, paths, Some(&server))
         .args(&args)
         .stdin(Stdio::null())
         .stdout(log)
@@ -315,7 +321,7 @@ fn run_inner(
         emit(
             &progress,
             BenchmarkProgress::Ready {
-                runtime: resolved_runtime(cfg, paths),
+                runtime: runtime_label.clone(),
                 effective_context,
                 load_ms,
             },
@@ -339,8 +345,8 @@ fn run_inner(
             model: model_id,
             model_path: model_path.display().to_string(),
             model_bytes: models::model_bytes(&model_path),
-            runtime: resolved_runtime(cfg, paths),
-            runtime_version: runtime_version(paths),
+            runtime: runtime_label,
+            runtime_version: runtime_version_label,
             backend: cfg.backend.clone(),
             effective_context,
             output_tokens: MAX_GENERATION_TOKENS,
@@ -1073,11 +1079,8 @@ fn resolved_runtime(cfg: &Config, paths: &Paths) -> String {
         .unwrap_or_else(|| "managed".into())
 }
 
-fn runtime_version(paths: &Paths) -> String {
-    let Some(binary) = process::server_binary(paths) else {
-        return "unknown".into();
-    };
-    process::runtime_command(&binary, paths)
+fn runtime_version_for(binary: &Path, paths: &Paths) -> String {
+    process::runtime_command_for(binary, paths, Some(binary))
         .arg("--version")
         .output()
         .ok()

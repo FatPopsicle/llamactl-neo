@@ -161,6 +161,7 @@ struct RenameState {
 struct RuntimePicker {
     options: Vec<String>,
     selected: usize,
+    profile: bool,
 }
 
 struct TemplatePicker {
@@ -242,6 +243,7 @@ struct EditorSettings {
     chat_template_kwargs: String,
     extra: Vec<String>,
     assign: bool,
+    runtime: String,
 }
 impl Default for EditorSettings {
     fn default() -> Self {
@@ -291,6 +293,7 @@ impl Default for EditorSettings {
             chat_template_kwargs: String::new(),
             extra: vec![],
             assign: false,
+            runtime: String::new(),
         }
     }
 }
@@ -342,6 +345,7 @@ enum EditorField {
     Jinja,
     ChatTemplate,
     ChatTemplateKwargs,
+    Runtime,
 }
 
 struct EditorPrompt {
@@ -1952,7 +1956,30 @@ impl<'a> App<'a> {
             .iter()
             .position(|runtime| runtime == &self.cfg.runtime)
             .unwrap_or(0);
-        self.runtime_picker = Some(RuntimePicker { options, selected });
+        self.runtime_picker = Some(RuntimePicker {
+            options,
+            selected,
+            profile: false,
+        });
+    }
+    fn open_profile_runtime_picker(&mut self) {
+        let current = self
+            .profile_editor
+            .as_ref()
+            .map(|editor| editor.settings.runtime.clone())
+            .unwrap_or_default();
+        let mut options = vec!["(settings)".to_owned()];
+        options.extend(available_runtimes(self.paths, &self.cfg.runtime));
+        let selected = if current.is_empty() {
+            0
+        } else {
+            options.iter().position(|runtime| runtime == &current).unwrap_or(0)
+        };
+        self.runtime_picker = Some(RuntimePicker {
+            options,
+            selected,
+            profile: true,
+        });
     }
     fn handle_runtime_picker(&mut self, key: KeyEvent) {
         match key.code {
@@ -1984,10 +2011,26 @@ impl<'a> App<'a> {
                     .as_ref()
                     .and_then(|picker| picker.options.get(picker.selected))
                     .cloned();
+                let profile = self
+                    .runtime_picker
+                    .as_ref()
+                    .map(|picker| picker.profile)
+                    .unwrap_or(false);
                 self.runtime_picker = None;
                 if let Some(runtime) = runtime {
-                    self.cfg.runtime = runtime;
-                    self.save_runtime_state();
+                    if profile {
+                        if let Some(editor) = self.profile_editor.as_mut() {
+                            editor.settings.runtime = if runtime == "(settings)" {
+                                String::new()
+                            } else {
+                                runtime
+                            };
+                            self.spawn_editor_estimate();
+                        }
+                    } else {
+                        self.cfg.runtime = runtime;
+                        self.save_runtime_state();
+                    }
                 }
             }
             _ => {}
@@ -1996,6 +2039,11 @@ impl<'a> App<'a> {
     fn editor_on_chat_template(&self) -> bool {
         self.profile_editor.as_ref().is_some_and(|editor| {
             editor.fields.get(editor.selected).copied() == Some(EditorField::ChatTemplate)
+        })
+    }
+    fn editor_on_runtime(&self) -> bool {
+        self.profile_editor.as_ref().is_some_and(|editor| {
+            editor.fields.get(editor.selected).copied() == Some(EditorField::Runtime)
         })
     }
     fn open_template_picker(&mut self) {
@@ -2478,6 +2526,11 @@ impl<'a> App<'a> {
             EditorField::FrequencyPenalty => ["0.0", "0.3", "0.5"].map(str::to_owned).to_vec(),
             EditorField::Fit => ["on", "off"].map(str::to_owned).to_vec(),
             EditorField::Numa => ["off", "distribute", "isolate"].map(str::to_owned).to_vec(),
+            EditorField::Runtime => {
+                let mut list = vec!["(settings)".to_owned()];
+                list.extend(available_runtimes(self.paths, &self.cfg.runtime));
+                list
+            }
             _ => vec![],
         };
         let current = editor_field_value(field, s);
@@ -2538,6 +2591,13 @@ impl<'a> App<'a> {
             EditorField::ChatTemplate => s.chat_template = raw.to_owned(),
             EditorField::ChatTemplateKwargs => s.chat_template_kwargs = raw.to_owned(),
             EditorField::Extra => s.extra = raw.split_whitespace().map(str::to_owned).collect(),
+            EditorField::Runtime => {
+                s.runtime = if raw == "(settings)" || raw.is_empty() {
+                    String::new()
+                } else {
+                    raw.to_owned()
+                };
+            }
             EditorField::Assign | EditorField::Advanced => {}
         }
     }
@@ -2698,6 +2758,10 @@ impl<'a> App<'a> {
             EditorField::ChatTemplateKwargs => (
                 "Chat template kwargs (JSON object)",
                 editor.settings.chat_template_kwargs.clone(),
+            ),
+            EditorField::Runtime => (
+                "Runtime (blank = settings runtime)",
+                editor.settings.runtime.clone(),
             ),
             _ => return,
         };
@@ -2901,6 +2965,9 @@ impl<'a> App<'a> {
                 }
                 EditorField::Extra => {
                     editor.settings.extra = text.split_whitespace().map(str::to_owned).collect();
+                }
+                EditorField::Runtime => {
+                    editor.settings.runtime = text;
                 }
                 _ => {}
             }
@@ -3145,14 +3212,18 @@ impl<'a> App<'a> {
                 }
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                if self.editor_on_chat_template() {
+                if self.editor_on_runtime() {
+                    self.open_profile_runtime_picker();
+                } else if self.editor_on_chat_template() {
                     self.open_template_picker();
                 } else {
                     self.editor_cycle(-1);
                 }
             }
             KeyCode::Right | KeyCode::Char('l') => {
-                if self.editor_on_chat_template() {
+                if self.editor_on_runtime() {
+                    self.open_profile_runtime_picker();
+                } else if self.editor_on_chat_template() {
                     self.open_template_picker();
                 } else {
                     self.editor_cycle(1);
@@ -7021,7 +7092,7 @@ const EDITOR_ADVANCED_CATEGORY: EditorCategory = EditorCategory {
 };
 const EDITOR_PROFILE_CATEGORY: EditorCategory = EditorCategory {
     label: "PROFILE",
-    fields: &[EditorField::Extra, EditorField::Assign],
+    fields: &[EditorField::Runtime, EditorField::Extra, EditorField::Assign],
 };
 
 enum EditorRow {
@@ -7137,6 +7208,7 @@ fn editor_field_label(field: EditorField) -> &'static str {
         EditorField::Jinja => "Jinja templates",
         EditorField::ChatTemplate => "Chat template",
         EditorField::ChatTemplateKwargs => "Template kwargs",
+        EditorField::Runtime => "Runtime",
     }
 }
 fn editor_field_value(field: EditorField, settings: &EditorSettings) -> String {
@@ -7264,6 +7336,13 @@ fn editor_field_value(field: EditorField, settings: &EditorSettings) -> String {
                 "—".into()
             } else {
                 settings.chat_template_kwargs.clone()
+            }
+        }
+        EditorField::Runtime => {
+            if settings.runtime.is_empty() {
+                "(settings)".into()
+            } else {
+                settings.runtime.clone()
             }
         }
     }
@@ -7401,6 +7480,7 @@ fn editor_settings_from_profile(profile: &serde_json::Map<String, Value>) -> Edi
         chat_template: s("chat-template", ""),
         chat_template_file: s("chat-template-file", ""),
         chat_template_kwargs: s("chat-template-kwargs", ""),
+        runtime: s("_runtime", ""),
         extra,
         assign: false,
     };
@@ -7462,6 +7542,7 @@ fn editor_profile_from_profile(
         "chat-template-file",
         "chat-template-kwargs",
         "_extra_args",
+        "_runtime",
     ];
     let mut profile = original.clone();
     for key in MANAGED {
@@ -7644,6 +7725,11 @@ fn editor_profile_from_profile(
                     .collect(),
             ),
         );
+    }
+    if settings.runtime.is_empty() {
+        profile.remove("_runtime");
+    } else {
+        profile.insert("_runtime".into(), Value::String(settings.runtime.clone()));
     }
     profile
 }
@@ -8832,6 +8918,27 @@ mod profile_editor_tests {
             out.get("chat-template-file").and_then(Value::as_str),
             Some("/x/chat.jinja")
         );
+    }
+
+    #[test]
+    fn runtime_pin_roundtrips_through_editor() {
+        let profile = map(json!({
+            "_model": "m",
+            "_runtime": "managed:foo",
+            "ctx-size": 4096
+        }));
+        let settings = editor_settings_from_profile(&profile);
+        assert_eq!(settings.runtime, "managed:foo");
+        let out = editor_profile_from_profile(&profile, &settings, "m");
+        assert_eq!(
+            out.get("_runtime").and_then(Value::as_str),
+            Some("managed:foo")
+        );
+
+        let mut cleared = settings;
+        cleared.runtime = String::new();
+        let out = editor_profile_from_profile(&profile, &cleared, "m");
+        assert!(out.get("_runtime").is_none());
     }
 
     #[test]
