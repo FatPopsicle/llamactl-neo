@@ -149,6 +149,27 @@ pub fn known_flags(paths: &Paths) -> Option<BTreeSet<String>> {
             .collect(),
     )
 }
+/// Discover the installed vllm's flag surface from the managed entrypoint.
+/// ponytail: runs `serve --help=all` (a torch import, ~seconds) per call; cache
+/// per-version if launch latency ever matters.
+pub fn known_flags_vllm(paths: &Paths) -> Option<BTreeSet<String>> {
+    let binary = crate::update::vllm_binary(paths)?;
+    let output = Command::new(&binary)
+        .args(["serve", "--help=all"])
+        .output()
+        .ok()?;
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Some(
+        FLAG_RE
+            .captures_iter(&text)
+            .map(|capture| capture[1].to_owned())
+            .collect(),
+    )
+}
 
 fn flag_value(args: &[String], flags: &[&str]) -> Option<String> {
     args.windows(2)
@@ -226,6 +247,21 @@ pub fn build_command(
     let query = profile_name
         .and_then(|p| profiles.owner(p))
         .unwrap_or(query);
+    // Framework axis: llama.cpp routes through the existing path below,
+    // byte-identical. Non-llama.cpp frameworks fail loudly here rather than
+    // silently launching llama.cpp. ponytail: live vllm/sglang dispatch
+    // (entrypoint + model-arg + known_flags) is deferred pending the
+    // entrypoint/venv-pointer decision; wiring lands where this match returns.
+    if let Some(profile) = profile_name {
+        match profiles.framework(profile)? {
+            "llama.cpp" => {}
+            "sglang" => bail!(
+                "sglang launch is deferred (no supported build) — declare `_framework: llama.cpp` or `vllm`"
+            ),
+            "vllm" => return build_vllm_command(cfg, paths, profiles, profile, extra),
+            other => bail!("framework '{other}' has no launch path"),
+        }
+    }
     let server = profile_name
         .and_then(|p| profiles.runtime(p))
         .and_then(|runtime| server_binary_for(paths, Some(runtime)))
@@ -264,6 +300,58 @@ pub fn build_command(
         }
     }
     Ok((binary, server, args, false))
+}
+
+/// Pure vllm command assembly (no binary resolution / no `--help` discovery),
+/// so it is unit-testable without launching anything.
+fn vllm_args(
+    cfg: &Config,
+    profiles: &Profiles,
+    profile: &str,
+    extra: &[String],
+    reserved: &[&str],
+    known: Option<&BTreeSet<String>>,
+) -> Result<Vec<String>> {
+    let mut args: Vec<String> = vec!["serve".into()];
+    args.extend(profiles.args_checked_fw(profile, reserved, "vllm", known)?);
+    args.extend(["--served-model-name".into(), profile.into()]);
+    args.extend([
+        "--host".into(),
+        cfg.host.clone(),
+        "--port".into(),
+        cfg.port.to_string(),
+    ]);
+    for key in cfg.keys() {
+        args.extend(["--api-key".into(), key]);
+    }
+    args.extend(extra.to_owned());
+    if !args
+        .iter()
+        .any(|arg| arg == "--model" || arg.starts_with("--model="))
+    {
+        bail!("vllm profile '{profile}' must specify a model (`--model`/`model`)");
+    }
+    Ok(args)
+}
+fn build_vllm_command(
+    cfg: &Config,
+    paths: &Paths,
+    profiles: &Profiles,
+    profile: &str,
+    extra: &[String],
+) -> Result<(PathBuf, PathBuf, Vec<String>, bool)> {
+    let binary = crate::update::vllm_binary(paths)
+        .context("vllm is not installed — run 'llamactl update'")?;
+    let known = known_flags_vllm(paths);
+    let args = vllm_args(
+        cfg,
+        profiles,
+        profile,
+        extra,
+        crate::profiles::reserved_for("vllm"),
+        known.as_ref(),
+    )?;
+    Ok((binary.clone(), binary, args, false))
 }
 
 pub fn serve(
@@ -1245,5 +1333,153 @@ mod runtime_pin_tests {
             server_binary_for(&paths, None).unwrap(),
             settings.join("llama-server")
         );
+    }
+}
+
+#[cfg(test)]
+mod framework_tests {
+    use super::*;
+    use crate::profiles::Profiles;
+    use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    fn dummy_paths() -> Paths {
+        // build_command bails at the framework check before any Paths field is
+        // dereferenced, so dummy paths are never touched.
+        Paths {
+            data_dir: PathBuf::new(),
+            state_dir: PathBuf::new(),
+            config: PathBuf::new(),
+            profiles: PathBuf::new(),
+            versions: PathBuf::new(),
+            current: PathBuf::new(),
+            pid: PathBuf::new(),
+            launch: PathBuf::new(),
+            log: PathBuf::new(),
+            swap_bin: PathBuf::new(),
+            swap_config: PathBuf::new(),
+            metadata_cache: PathBuf::new(),
+            profile_benchmarks: PathBuf::new(),
+            templates: PathBuf::new(),
+        }
+    }
+    fn profile_with(framework: Option<&str>) -> Profiles {
+        let mut map = serde_json::Map::new();
+        map.insert("_model".into(), json!("m"));
+        if let Some(framework) = framework {
+            map.insert("_framework".into(), json!(framework));
+        }
+        let mut profiles = BTreeMap::new();
+        profiles.insert("p".into(), map);
+        Profiles {
+            expose: vec!["*".into()],
+            profiles,
+            models: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn framework_defaults_to_llamacpp_and_validates() {
+        assert_eq!(profile_with(None).framework("p").unwrap(), "llama.cpp");
+        assert_eq!(profile_with(Some("")).framework("p").unwrap(), "llama.cpp");
+        assert_eq!(profile_with(Some("vllm")).framework("p").unwrap(), "vllm");
+        assert_eq!(profile_with(Some("sglang")).framework("p").unwrap(), "sglang");
+        assert!(profile_with(Some("nope")).framework("p").is_err());
+    }
+
+    #[test]
+    fn non_llamacpp_framework_fails_loudly_not_silently() {
+        let paths = dummy_paths();
+        let cfg = Config::default();
+
+        let err = build_command(&cfg, &paths, &profile_with(Some("vllm")), Some("m@p"), &[])
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("vllm is not installed"));
+
+        let err = build_command(&cfg, &paths, &profile_with(Some("sglang")), Some("m@p"), &[])
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("sglang launch is deferred"));
+
+        // llama.cpp / undeclared must NOT trip the framework bail.
+        let paths2 = dummy_paths();
+        let profiles = profile_with(None);
+        // reaches model resolution (no local model) -> a different error,
+        // proving the framework check passed through for llama.cpp.
+        let err = build_command(&cfg, &paths2, &profiles, Some("m@p"), &[]).unwrap_err();
+        assert!(!format!("{err:#}").contains("vllm is not installed"));
+    }
+}
+
+#[cfg(test)]
+mod vllm_args_tests {
+    use super::*;
+    use crate::profiles::Profiles;
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    fn profile(map: serde_json::Map<String, serde_json::Value>) -> Profiles {
+        let mut profiles = BTreeMap::new();
+        profiles.insert("p".into(), map);
+        Profiles {
+            expose: vec!["*".into()],
+            profiles,
+            models: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn reserved_set_is_endpoint_only_for_vllm() {
+        let reserved = crate::profiles::reserved_for("vllm");
+        assert!(reserved.contains(&"served-model-name"));
+        assert!(reserved.contains(&"port"));
+        assert!(!reserved.contains(&"model"));
+        assert!(crate::profiles::reserved_for("llama.cpp").contains(&"model"));
+    }
+
+    #[test]
+    fn assembles_reserved_and_exposable_and_requires_model() {
+        let cfg = Config::default();
+        let mut map = serde_json::Map::new();
+        map.insert("model".into(), json!("org/repo"));
+        map.insert("max-model-len".into(), json!(8192));
+        let profiles = profile(map);
+        let args =
+            vllm_args(&cfg, &profiles, "p", &[], crate::profiles::reserved_for("vllm"), None).unwrap();
+        for expected in [
+            "serve",
+            "--served-model-name",
+            "--host",
+            "--port",
+            "--model",
+            "org/repo",
+            "--max-model-len",
+            "8192",
+        ] {
+            assert!(args.iter().any(|a| a == expected), "missing {expected} in {args:?}");
+        }
+    }
+
+    #[test]
+    fn reserved_flag_set_by_profile_is_rejected() {
+        let cfg = Config::default();
+        let mut map = serde_json::Map::new();
+        map.insert("model".into(), json!("org/repo"));
+        map.insert("port".into(), json!(9999));
+        let profiles = profile(map);
+        let err =
+            vllm_args(&cfg, &profiles, "p", &[], crate::profiles::reserved_for("vllm"), None).unwrap_err();
+        assert!(format!("{err:#}").contains("managed by llamactl"));
+    }
+
+    #[test]
+    fn missing_model_is_rejected() {
+        let cfg = Config::default();
+        let mut map = serde_json::Map::new();
+        map.insert("max-model-len".into(), json!(8192));
+        let profiles = profile(map);
+        let err =
+            vllm_args(&cfg, &profiles, "p", &[], crate::profiles::reserved_for("vllm"), None).unwrap_err();
+        assert!(format!("{err:#}").contains("must specify a model"));
     }
 }

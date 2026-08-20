@@ -20,6 +20,32 @@ impl Default for Profiles {
         }
     }
 }
+const LLAMA_RESERVED: &[&str] = &[
+    "m",
+    "model",
+    "mmproj",
+    "model-url",
+    "hf",
+    "hf-repo",
+    "hf-file",
+    "host",
+    "port",
+    "api-key",
+    "alias",
+    "help",
+    "usage",
+    "version",
+];
+/// Reserved (llamactl-managed) flags per framework. llama.cpp owns model
+/// locating, so its managed set includes the model flags; frameworks like
+/// vllm do not locate the model, so their managed set is only the serving
+/// endpoint/alias/auth.
+pub fn reserved_for(framework: &str) -> &'static [&'static str] {
+    match framework {
+        "vllm" => &["host", "port", "api-key", "served-model-name"],
+        _ => LLAMA_RESERVED,
+    }
+}
 impl Profiles {
     pub fn load(paths: &Paths) -> Result<Self> {
         if !paths.profiles.exists() {
@@ -89,22 +115,26 @@ impl Profiles {
         name: &str,
         known: Option<&BTreeSet<String>>,
     ) -> Result<Vec<String>> {
-        const RESERVED: &[&str] = &[
-            "m",
-            "model",
-            "mmproj",
-            "model-url",
-            "hf",
-            "hf-repo",
-            "hf-file",
-            "host",
-            "port",
-            "api-key",
-            "alias",
-            "help",
-            "usage",
-            "version",
-        ];
+        self.args_impl(name, LLAMA_RESERVED, "llama.cpp", known)
+    }
+    /// Framework-aware variant: validates/emits the profile's flags against a
+    /// framework's reserved set + known-flag surface.
+    pub fn args_checked_fw(
+        &self,
+        name: &str,
+        reserved: &[&str],
+        runtime: &str,
+        known: Option<&BTreeSet<String>>,
+    ) -> Result<Vec<String>> {
+        self.args_impl(name, reserved, runtime, known)
+    }
+    fn args_impl(
+        &self,
+        name: &str,
+        reserved: &[&str],
+        runtime: &str,
+        known: Option<&BTreeSet<String>>,
+    ) -> Result<Vec<String>> {
         let p = self
             .profiles
             .get(name)
@@ -121,7 +151,7 @@ impl Profiles {
                 continue;
             }
             let key = key.trim_start_matches('-');
-            if RESERVED.contains(&key) {
+            if reserved.contains(&key) {
                 bail!("profile '{name}': --{key} is managed by llamactl")
             }
             if !self.is_exposed(key) {
@@ -139,14 +169,14 @@ impl Profiles {
                     .strip_prefix("--")
                     .map(|value| value.split('=').next().unwrap_or(value))
                 {
-                    if RESERVED.contains(&flag) {
+                    if reserved.contains(&flag) {
                         bail!("profile '{name}': --{flag} is managed by llamactl")
                     }
                     if !self.is_exposed(flag) {
                         bail!("profile '{name}': --{flag} is not exposed")
                     }
                     if known.is_some_and(|flags| !flags.contains(flag)) {
-                        bail!("profile '{name}': --{flag} is unknown to installed llama.cpp")
+                        bail!("profile '{name}': --{flag} is unknown to installed {runtime}")
                     }
                 }
             }
@@ -163,6 +193,29 @@ impl Profiles {
             .get("_runtime")?
             .as_str()
             .filter(|runtime| !runtime.is_empty())
+    }
+    /// The serving framework a profile declares via `_framework`.
+    /// Absent/empty resolves to `llama.cpp`, so existing profiles are
+    /// unaffected; an unknown value is an error (fail loudly, don't guess).
+    pub fn framework(&self, name: &str) -> Result<&str> {
+        use crate::config::FRAMEWORKS;
+        match self
+            .profiles
+            .get(name)
+            .and_then(|p| p.get("_framework"))
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(framework) if !framework.is_empty() => {
+                if !FRAMEWORKS.contains(&framework) {
+                    bail!(
+                        "profile '{name}': unknown framework '{framework}'\nvalid: {}",
+                        FRAMEWORKS.join(", ")
+                    );
+                }
+                Ok(framework)
+            }
+            _ => Ok("llama.cpp"),
+        }
     }
     pub fn binding(
         &self,

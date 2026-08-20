@@ -18,6 +18,10 @@ pub const BACKENDS: &[&str] = &[
     "openvino",
 ];
 
+// Serving frameworks a profile may declare via `_framework`. llama.cpp is the
+// default (absent/empty), so every existing profile is unaffected.
+pub const FRAMEWORKS: &[&str] = &["llama.cpp", "vllm", "sglang"];
+
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub data_dir: PathBuf,

@@ -50,6 +50,11 @@ enum Commands {
         restart: bool,
     },
 
+    InstallVllm {
+        #[arg(long)]
+        version: Option<String>,
+    },
+
     Start {
         model: Option<String>,
         #[arg(last = true)]
@@ -184,6 +189,10 @@ enum ProfileAction {
         name: String,
         runtime: Option<String>,
     },
+    Framework {
+        name: String,
+        framework: Option<String>,
+    },
     Set {
         name: String,
         key: String,
@@ -250,6 +259,15 @@ fn run() -> Result<()> {
                     "llama-swap {s}: {}",
                     if sc { "update available" } else { "up to date" }
                 );
+                match update::vllm_check(&paths) {
+                    Ok((installed, latest, available)) => println!(
+                        "vllm {} (latest {}): {}",
+                        installed.unwrap_or_else(|| "(not installed)".into()),
+                        latest,
+                        if available { "update available" } else { "up to date" }
+                    ),
+                    Err(_) => println!("vllm: (unknown — offline?)"),
+                }
             } else {
                 let running = process::pid(&paths).is_some();
                 update::install(&cfg, &paths)?;
@@ -278,6 +296,9 @@ fn run() -> Result<()> {
                     process::restart(&cfg, &paths, &profiles)?
                 );
             }
+        }
+        Some(Commands::InstallVllm { version }) => {
+            update::install_vllm(&paths, version.as_deref())?;
         }
         Some(Commands::Start { model, extra }) => {
             let p = Profiles::load(&paths)?;
@@ -719,6 +740,40 @@ fn profile_command(c: &Config, p: &Paths, a: Option<ProfileAction>) -> Result<()
                     profiles.save(p)?;
                     refresh = true;
                     println!("✓ {name} pinned to runtime {runtime}");
+                }
+            }
+        }
+        Some(ProfileAction::Framework { name, framework }) => {
+            match framework {
+                None => {
+                    let current = profiles.framework(&name)?;
+                    println!("{name}: {current}");
+                }
+                Some(framework) if framework.is_empty() => {
+                    let profile = profiles
+                        .profiles
+                        .get_mut(&name)
+                        .with_context(|| format!("unknown profile '{name}'"))?;
+                    profile.remove("_framework");
+                    profiles.save(p)?;
+                    refresh = true;
+                    println!("✓ {name} now uses the default framework (llama.cpp)");
+                }
+                Some(framework) => {
+                    if !config::FRAMEWORKS.contains(&framework.as_str()) {
+                        bail!(
+                            "invalid framework '{framework}'\nvalid: {}",
+                            config::FRAMEWORKS.join(", ")
+                        );
+                    }
+                    let profile = profiles
+                        .profiles
+                        .get_mut(&name)
+                        .with_context(|| format!("unknown profile '{name}'"))?;
+                    profile.insert("_framework".into(), serde_json::Value::String(framework.clone()));
+                    profiles.save(p)?;
+                    refresh = true;
+                    println!("✓ {name} pinned to framework {framework}");
                 }
             }
         }
